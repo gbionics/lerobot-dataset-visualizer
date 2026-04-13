@@ -53,10 +53,13 @@ function getRobotConfig(robotType: string | null) {
       scale: 3,
     };
   }
-  return {
-    urdfUrl: `${URDF_BASE_URL}/so101/so101_new_calib.urdf`,
-    scale: 10,
-  };
+  if (lower.includes("ergocub")) {
+    return { urdfUrl: "/urdf/ergoCub/ergoCubSN002/model.urdf", scale: 1 };
+  }
+  if (lower.includes("so100") && !lower.includes("so101")) {
+    return { urdfUrl: "/urdf/so101/so100.urdf", scale: 10 };
+  }
+  return { urdfUrl: "/urdf/so101/so101_new_calib.urdf", scale: 10 };
 }
 
 // Detect unit: servo ticks (0-4096), degrees (>6.28), or radians
@@ -113,6 +116,34 @@ const G1_SDK_TO_URDF: Record<string, string> = {
   "krightwristyaw.q": "right_wrist_yaw_joint",
 };
 
+// ergoCub URDF joint name → dataset column suffix
+// The dataset uses a single open/close ("_oc") value per finger group;
+// URDF splits each finger into prox/dist/add joints — all driven by the same column.
+const ERGOCUB_URDF_TO_SUFFIX: Record<string, string> = {
+  l_thumb_prox: "l_thumb_oc",
+  l_thumb_dist: "l_thumb_oc",
+  l_index_add: "l_index_oc",
+  l_index_prox: "l_index_oc",
+  l_index_dist: "l_index_oc",
+  l_middle_prox: "l_middle_oc",
+  l_middle_dist: "l_middle_oc",
+  l_ring_prox: "l_ring_pinky_oc",
+  l_ring_dist: "l_ring_pinky_oc",
+  l_pinkie_prox: "l_ring_pinky_oc",
+  l_pinkie_dist: "l_ring_pinky_oc",
+  r_thumb_prox: "r_thumb_oc",
+  r_thumb_dist: "r_thumb_oc",
+  r_index_add: "r_index_oc",
+  r_index_prox: "r_index_oc",
+  r_index_dist: "r_index_oc",
+  r_middle_prox: "r_middle_oc",
+  r_middle_dist: "r_middle_oc",
+  r_ring_prox: "r_ring_pinky_oc",
+  r_ring_dist: "r_ring_pinky_oc",
+  r_pinkie_prox: "r_ring_pinky_oc",
+  r_pinkie_dist: "r_ring_pinky_oc",
+};
+
 function autoMatchJoints(
   urdfJointNames: string[],
   columnKeys: string[],
@@ -144,6 +175,16 @@ function autoMatchJoints(
     if (g1Col) {
       mapping[jointName] = g1Col;
       continue;
+    }
+
+    // ergoCub finger coupling: prox/dist/add → _oc column
+    const ergoCubSuffix = ERGOCUB_URDF_TO_SUFFIX[lower];
+    if (ergoCubSuffix) {
+      const idx = suffixes.findIndex((s) => s === ergoCubSuffix);
+      if (idx >= 0) {
+        mapping[jointName] = columnKeys[idx];
+        continue;
+      }
     }
 
     // OpenArm: openarm_(left|right)_joint(\d+) → (left|right)_joint_(\d+)
@@ -186,6 +227,7 @@ const SINGLE_ARM_TIP_NAMES = [
 ];
 const DUAL_ARM_TIP_NAMES = ["openarm_left_hand_tcp", "openarm_right_hand_tcp"];
 const G1_TIP_NAMES = ["left_hand_palm_link", "right_hand_palm_link"];
+const ERGOCUB_TIP_NAMES = ["l_hand_palm", "r_hand_palm"];
 const TRAIL_DURATION = 1.0;
 const TRAIL_COLORS = [new THREE.Color("#ff6600"), new THREE.Color("#00aaff")];
 const MAX_TRAIL_POINTS = 300;
@@ -279,6 +321,7 @@ function RobotScene({
     setError(null);
     const isOpenArm = urdfUrl.includes("openarm");
     const isG1 = urdfUrl.includes("g1");
+    const isErgoCub = urdfUrl.includes("ergoCub");
     const manager = new THREE.LoadingManager();
     const loader = new URDFLoader(manager);
     // URDFLoader (node_modules/urdf-loader/src/URDFLoader.js ~line 556) does
@@ -421,6 +464,10 @@ function RobotScene({
           metalness = 0.15;
           roughness = 0.6;
           side = THREE.DoubleSide;
+        } else if (isErgoCub) {
+          color = "#c8c8d0";
+          metalness = 0.25;
+          roughness = 0.5;
         }
         return new THREE.Mesh(
           geometry,
@@ -498,6 +545,9 @@ function RobotScene({
       }, 0);
     };
 
+    if (isErgoCub) {
+      loader.packages = { ergoCub: "/urdf/ergoCub/ergoCubSN002" };
+    }
     loader.load(
       urdfUrl,
       (robot) => {
@@ -523,13 +573,15 @@ function RobotScene({
 
         const tipNames = isG1
           ? G1_TIP_NAMES
-          : isOpenArm
-            ? DUAL_ARM_TIP_NAMES
-            : SINGLE_ARM_TIP_NAMES;
+          : isErgoCub
+            ? ERGOCUB_TIP_NAMES
+            : isOpenArm
+              ? DUAL_ARM_TIP_NAMES
+              : SINGLE_ARM_TIP_NAMES;
         const tips: THREE.Object3D[] = [];
         for (const name of tipNames) {
           if (robot.frames[name]) tips.push(robot.frames[name]);
-          if (!isOpenArm && !isG1 && tips.length === 1) break;
+          if (!isOpenArm && !isG1 && !isErgoCub && tips.length === 1) break;
         }
         tipLinksRef.current = tips;
         ensureTrails(tips.length);
