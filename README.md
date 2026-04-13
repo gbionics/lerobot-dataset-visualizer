@@ -178,10 +178,10 @@ The Docker image is pre-configured for local dataset mode. Mount your local data
 docker run -p 7860:7860 -v /absolute/path/to/your/datasets:/data lerobot-visualizer
 ```
 
-For example, if your datasets are at `../gb-lerobot/datasets` relative to the project:
+For example, if your datasets are at `../my-datasets` relative to the project:
 
 ```bash
-docker run -p 7860:7860 -v $(realpath ../gb-lerobot/datasets):/data lerobot-visualizer
+docker run -p 7860:7860 -v $(realpath ../my-datasets):/data lerobot-visualizer
 ```
 
 > **Note:** The `-v` flag mounts a host directory into the container. The path before `:` must be an absolute path on your host machine. The path after `:` must be `/data` to match the container's `LOCAL_DATASET_PATH`.
