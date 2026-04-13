@@ -105,6 +105,17 @@ bun run format
   backend (`backend/app.py`). When set, the Annotations tab can save edits and
   rewrite parquet shards / push to the Hub. When unset the tab is read/edit
   only with sessionStorage persistence.
+- `LOCAL_DATASET_PATH`: (optional) Path to a local dataset directory. Enables local mode.
+
+### Local Dataset Mode
+
+To run the dev server with a local dataset:
+
+```bash
+LOCAL_DATASET_PATH=/path/to/your/datasets bun dev
+```
+
+This sets `NEXT_PUBLIC_LOCAL_MODE` at build time so the app serves data from the local filesystem instead of HuggingFace.
 
 ## Annotations backend (optional)
 
@@ -145,17 +156,35 @@ This application can be deployed using Docker with bun for optimal performance a
 
 ### Build the Docker image
 
+The Dockerfile sets `LOCAL_DATASET_PATH=/data` at build time so that `NEXT_PUBLIC_LOCAL_MODE` is baked into the Next.js build. This means the image supports local datasets out of the box.
+
 ```bash
 docker build -t lerobot-visualizer .
 ```
 
-### Run the container
+### Run the container (remote HuggingFace datasets)
 
 ```bash
 docker run -p 7860:7860 lerobot-visualizer
 ```
 
 The application will be available at [http://localhost:7860](http://localhost:7860).
+
+### Run with local datasets
+
+The Docker image is pre-configured for local dataset mode. Mount your local dataset directory into the container at `/data`:
+
+```bash
+docker run -p 7860:7860 -v /absolute/path/to/your/datasets:/data lerobot-visualizer
+```
+
+For example, if your datasets are at `../gb-lerobot/datasets` relative to the project:
+
+```bash
+docker run -p 7860:7860 -v $(realpath ../gb-lerobot/datasets):/data lerobot-visualizer
+```
+
+> **Note:** The `-v` flag mounts a host directory into the container. The path before `:` must be an absolute path on your host machine. The path after `:` must be `/data` to match the container's `LOCAL_DATASET_PATH`.
 
 ### Run with custom environment variables
 
