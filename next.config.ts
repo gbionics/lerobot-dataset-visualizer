@@ -16,6 +16,9 @@ const nextConfig: NextConfig = {
     optimizePackageImports: ["react-icons", "recharts", "@huggingface/hub"],
   },
   generateBuildId: () => packageJson.version,
+  env: {
+    NEXT_PUBLIC_LOCAL_MODE: process.env.LOCAL_DATASET_PATH ? "1" : "",
+  },
 };
 
 export default nextConfig;
