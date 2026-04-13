@@ -1,12 +1,9 @@
 "use client";
 
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useRef, useCallback } from "react";
 import { useTime } from "../context/time-context";
 import { FaExpand, FaCompress, FaTimes, FaEye } from "react-icons/fa";
 import type { VideoInfo } from "@/types";
-import { proxyHfUrl } from "@/utils/auth";
-import { VideoOverlayCanvas } from "./video-overlay-canvas";
-import { ColormappedVideo } from "./colormapped-video";
 
 const THRESHOLDS = {
   VIDEO_SYNC_TOLERANCE: 0.2,
@@ -26,34 +23,8 @@ export const SimpleVideosPlayer = ({
   videosInfo,
   onVideosReady,
 }: VideoPlayerProps) => {
-  const { currentTime, seek, externalSeekVersion, isPlaying, setIsPlaying } =
-    useTime();
+  const { currentTime, setCurrentTime, isPlaying, setIsPlaying } = useTime();
   const videoRefs = useRef<(HTMLVideoElement | null)[]>([]);
-  // Mirror videoRefs into state so the absolutely-positioned VQA overlay can
-  // re-render with the actual <video> element once it mounts. Using a ref
-  // alone means the overlay's first render still sees `null`.
-  const [videoEls, setVideoEls] = React.useState<(HTMLVideoElement | null)[]>(
-    () => [],
-  );
-  // Stable ref callbacks per index. If we used inline `(el) => { ... }` here
-  // React would re-invoke the callback on every render (the function identity
-  // changes), which combined with `setVideoEls` would toggle state on each
-  // tick and produce a "Maximum update depth exceeded" loop.
-  const videoRefCallbacksRef = useRef<
-    ((el: HTMLVideoElement | null) => void)[]
-  >([]);
-  while (videoRefCallbacksRef.current.length < videosInfo.length) {
-    const idx = videoRefCallbacksRef.current.length;
-    videoRefCallbacksRef.current.push((el: HTMLVideoElement | null) => {
-      videoRefs.current[idx] = el;
-      setVideoEls((prev) => {
-        if (prev[idx] === el) return prev;
-        const next = prev.slice();
-        next[idx] = el;
-        return next;
-      });
-    });
-  }
   const [hiddenVideos, setHiddenVideos] = React.useState<string[]>([]);
   const [enlargedVideo, setEnlargedVideo] = React.useState<string | null>(null);
   const [showHiddenMenu, setShowHiddenMenu] = React.useState(false);
@@ -65,34 +36,9 @@ export const SimpleVideosPlayer = ({
     (video) => !hiddenSet.has(video.filename),
   );
 
-  // Last externalSeekVersion we observed in the sync effect. When the
-  // context's version moves past this, an external seek happened and we
-  // need to drive every video to the new position.
-  const lastSeekVersionRef = useRef(externalSeekVersion);
-
-  // Mirror firstVisibleIdx into a ref so the videos-ready effect doesn't have
-  // to depend on it. If it did, hiding the first camera would tear the whole
-  // effect down and back up, re-attaching `canplaythrough` listeners that
-  // never re-fire (the videos are already loaded), leaving readyCount stuck
-  // at 0 until the 10s timeout — at which point markReady forces play even
-  // if the user paused.
-  const firstVisibleIdxRef = useRef(firstVisibleIdx);
-  useEffect(() => {
-    firstVisibleIdxRef.current = firstVisibleIdx;
-  }, [firstVisibleIdx]);
-
-  // Mirror onVideosReady into a ref for the same reason. Parents typically
-  // pass an inline arrow (`onVideosReady={() => setVideosReady(true)}`) which
-  // gets a new identity every render. Including it in the videos-ready
-  // effect's deps caused that effect to tear down + setup on every parent
-  // render. The setup branch then ran `queueMicrotask(handleLoadedData)` for
-  // every already-loaded video (true after the first load), seeking each
-  // back to segmentStart — videos got pinned on their first frame and never
-  // advanced.
-  const onVideosReadyRef = useRef(onVideosReady);
-  useEffect(() => {
-    onVideosReadyRef.current = onVideosReady;
-  }, [onVideosReady]);
+  // Tracks the last time value set by the primary video's onTimeUpdate.
+  // If currentTime differs from this, an external source (slider/chart click) changed it.
+  const lastVideoTimeRef = useRef(0);
 
   // Initialize video refs array
   useEffect(() => {
@@ -109,7 +55,7 @@ export const SimpleVideosPlayer = ({
       if (resolved) return;
       resolved = true;
       setVideosReady(true);
-      onVideosReadyRef.current?.();
+      onVideosReady?.();
       setIsPlaying(true);
     };
 
@@ -120,126 +66,54 @@ export const SimpleVideosPlayer = ({
 
     const timeout = setTimeout(markReady, VIDEO_READY_TIMEOUT_MS);
 
-    // Coordinated loop reset — when the primary video hits its segment end
-    // (or natural end), seek every camera to its own segmentStart in a
-    // single synchronous burst. The previous design seeked the primary,
-    // then bumped externalSeekVersion which scheduled the other seeks via
-    // a React render — leaving an 80ms (throttled) gap where the primary
-    // played fresh frames while the others still showed the segment-end
-    // frame. Now the gap is microseconds.
-    const loopAllVideos = () => {
-      videoRefs.current.forEach((other, otherIdx) => {
-        if (!other) return;
-        const otherInfo = videosInfo[otherIdx];
-        if (!otherInfo) return;
-        other.currentTime = otherInfo.segmentStart ?? 0;
-      });
-      // Update the slider as a status report — don't bump externalSeekVersion
-      // since we already drove every video to its target.
-      seek(0, "video");
-    };
-
     videoRefs.current.forEach((video, index) => {
-      if (!video) return;
-      const info = videosInfo[index];
+      if (video) {
+        const info = videosInfo[index];
 
-      // One timeupdate handler per video covers both jobs:
-      // (a) loop-reset on segmented videos at segment-end
-      // (b) reporting the primary video's currentTime back to the context
-      const handleTimeUpdate = () => {
         if (info.isSegmented) {
-          const segmentEnd = info.segmentEnd ?? video.duration;
-          const segmentStart = info.segmentStart ?? 0;
-          if (
-            video.currentTime >=
-            segmentEnd - THRESHOLDS.VIDEO_SEGMENT_BOUNDARY
-          ) {
-            // Primary drives the coordinated loop. Non-primary cameras
-            // that race ahead just snap to segmentStart and wait — the
-            // primary's next loop will re-align everyone.
-            if (index === firstVisibleIdxRef.current) {
-              loopAllVideos();
-            } else {
-              video.currentTime = segmentStart;
-            }
-            return;
-          }
-        }
-        if (index === firstVisibleIdxRef.current) {
-          let globalTime = video.currentTime;
-          if (info.isSegmented) {
-            globalTime = video.currentTime - (info.segmentStart ?? 0);
-          }
-          seek(globalTime, "video");
-        }
-      };
+          const handleTimeUpdate = () => {
+            const segmentEnd = info.segmentEnd || video.duration;
+            const segmentStart = info.segmentStart || 0;
 
-      // For segmented videos, snap into the segment when play() is called
-      // — covers the case where the user paused outside the segment range.
-      const handlePlay = info.isSegmented
-        ? () => {
-            const segmentStart = info.segmentStart ?? 0;
-            const segmentEnd = info.segmentEnd ?? video.duration;
             if (
-              video.currentTime < segmentStart ||
-              video.currentTime >= segmentEnd
+              video.currentTime >=
+              segmentEnd - THRESHOLDS.VIDEO_SEGMENT_BOUNDARY
             ) {
               video.currentTime = segmentStart;
-            }
-          }
-        : null;
-
-      const handleLoadedData = info.isSegmented
-        ? () => {
-            video.currentTime = info.segmentStart ?? 0;
-            checkReady();
-          }
-        : null;
-
-      const handleEnded = info.isSegmented
-        ? null
-        : () => {
-            // Same coordinated loop strategy for non-segmented videos at
-            // their natural end — primary drives, others wait for primary
-            // to align them.
-            if (index === firstVisibleIdxRef.current) {
-              loopAllVideos();
-            } else {
-              video.currentTime = 0;
+              if (index === firstVisibleIdx) {
+                setCurrentTime(0);
+              }
             }
           };
 
-      video.addEventListener("timeupdate", handleTimeUpdate);
-      if (handlePlay) video.addEventListener("play", handlePlay);
-      if (handleEnded) video.addEventListener("ended", handleEnded);
+          const handleLoadedData = () => {
+            video.currentTime = info.segmentStart || 0;
+            checkReady();
+          };
 
-      // Already-loaded videos (cached or fast network) will never re-fire
-      // canplaythrough / loadeddata after we attach the listener — so check
-      // readyState synchronously and mark ready in a microtask. Without this,
-      // checkReady wouldn't be called and only the 10s fallback timeout would
-      // eventually unfreeze the UI.
-      if (info.isSegmented && handleLoadedData) {
-        if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) {
-          queueMicrotask(handleLoadedData);
-        } else {
+          video.addEventListener("timeupdate", handleTimeUpdate);
           video.addEventListener("loadeddata", handleLoadedData);
-        }
-      } else if (!info.isSegmented) {
-        if (video.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA) {
-          queueMicrotask(checkReady);
+
+          videoEventCleanup.set(video, () => {
+            video.removeEventListener("timeupdate", handleTimeUpdate);
+            video.removeEventListener("loadeddata", handleLoadedData);
+          });
         } else {
+          const handleEnded = () => {
+            video.currentTime = 0;
+            if (index === firstVisibleIdx) {
+              setCurrentTime(0);
+            }
+          };
+
+          video.addEventListener("ended", handleEnded);
           video.addEventListener("canplaythrough", checkReady, { once: true });
+
+          videoEventCleanup.set(video, () => {
+            video.removeEventListener("ended", handleEnded);
+          });
         }
       }
-
-      videoEventCleanup.set(video, () => {
-        video.removeEventListener("timeupdate", handleTimeUpdate);
-        if (handlePlay) video.removeEventListener("play", handlePlay);
-        if (handleLoadedData)
-          video.removeEventListener("loadeddata", handleLoadedData);
-        if (handleEnded) video.removeEventListener("ended", handleEnded);
-        video.removeEventListener("canplaythrough", checkReady);
-      });
     });
 
     return () => {
@@ -253,12 +127,13 @@ export const SimpleVideosPlayer = ({
         }
       });
     };
-    // firstVisibleIdx intentionally omitted — we read it via ref so hiding
-    // the first camera doesn't reset readiness (see the comment near
-    // firstVisibleIdxRef above).
-    // onVideosReady intentionally omitted — read via onVideosReadyRef so
-    // an inline parent prop doesn't tear this effect down on every render.
-  }, [videosInfo, setIsPlaying, seek]);
+  }, [
+    videosInfo,
+    onVideosReady,
+    setIsPlaying,
+    firstVisibleIdx,
+    setCurrentTime,
+  ]);
 
   // Handle play/pause — skip hidden videos
   useEffect(() => {
@@ -278,24 +153,24 @@ export const SimpleVideosPlayer = ({
     });
   }, [isPlaying, videosReady, hiddenSet, videosInfo]);
 
-  // Drive every video to currentTime on external seeks (slider drag, chart
-  // click, loop reset). The version-based check replaces a 0.3s heuristic
-  // that misfired when a network stall produced a >0.3s timeupdate jump
-  // and incorrectly classified it as a user seek — causing every camera to
-  // re-seek, which itself stalled them in a feedback spiral.
+  // Sync all video times when currentTime changes.
+  // For the primary video, only seek when the change came from an external source
+  // (slider drag, chart click, etc.) — detected by comparing against lastVideoTimeRef.
   useEffect(() => {
     if (!videosReady) return;
-    if (externalSeekVersion === lastSeekVersionRef.current) return;
-    lastSeekVersionRef.current = externalSeekVersion;
+
+    const isExternalSeek =
+      Math.abs(currentTime - lastVideoTimeRef.current) > 0.3;
 
     videoRefs.current.forEach((video, index) => {
       if (!video) return;
       if (hiddenSet.has(videosInfo[index].filename)) return;
+      if (index === firstVisibleIdx && !isExternalSeek) return;
 
       const info = videosInfo[index];
       let targetTime = currentTime;
       if (info.isSegmented) {
-        targetTime = (info.segmentStart ?? 0) + currentTime;
+        targetTime = (info.segmentStart || 0) + currentTime;
       }
 
       if (
@@ -305,7 +180,43 @@ export const SimpleVideosPlayer = ({
         video.currentTime = targetTime;
       }
     });
-  }, [externalSeekVersion, currentTime, videosInfo, videosReady, hiddenSet]);
+  }, [currentTime, videosInfo, videosReady, hiddenSet, firstVisibleIdx]);
+
+  // Stable per-index timeupdate handlers avoid findIndex scan on every event
+  const makeTimeUpdateHandler = useCallback(
+    (index: number) => {
+      return () => {
+        const video = videoRefs.current[index];
+        const info = videosInfo[index];
+        if (!video || !info) return;
+
+        let globalTime = video.currentTime;
+        if (info.isSegmented) {
+          globalTime = video.currentTime - (info.segmentStart || 0);
+        }
+        lastVideoTimeRef.current = globalTime;
+        setCurrentTime(globalTime);
+      };
+    },
+    [videosInfo, setCurrentTime],
+  );
+
+  // Handle play click for segmented videos
+  const handlePlay = (video: HTMLVideoElement, info: VideoInfo) => {
+    if (info.isSegmented) {
+      const segmentStart = info.segmentStart || 0;
+      const segmentEnd = info.segmentEnd || video.duration;
+
+      if (video.currentTime < segmentStart || video.currentTime >= segmentEnd) {
+        video.currentTime = segmentStart;
+      }
+    }
+    video.play().catch((e: unknown) => {
+      if ((e as Error)?.name !== "AbortError") {
+        console.error("Error playing video", e);
+      }
+    });
+  };
 
   return (
     <>
@@ -313,20 +224,20 @@ export const SimpleVideosPlayer = ({
       {hiddenVideos.length > 0 && (
         <div className="relative mb-4">
           <button
-            className="inline-flex items-center gap-2 h-8 rounded-md panel px-3 text-xs text-slate-300 hover:text-slate-100 hover:bg-white/5 transition-colors"
+            className="flex items-center gap-2 rounded bg-slate-800 px-3 py-2 text-sm text-slate-100 hover:bg-slate-700 border border-slate-500"
             onClick={() => setShowHiddenMenu(!showHiddenMenu)}
           >
-            <FaEye size={11} /> Show hidden · {hiddenVideos.length}
+            <FaEye /> Show Hidden Videos ({hiddenVideos.length})
           </button>
           {showHiddenMenu && (
-            <div className="absolute left-0 mt-1.5 w-max panel-raised bg-[var(--surface-1)] shadow-xl p-1.5 z-50">
-              <div className="mb-1 px-2 text-[10px] uppercase tracking-wide text-slate-500">
-                Restore hidden videos
+            <div className="absolute left-0 mt-2 w-max rounded border border-slate-500 bg-slate-900 shadow-lg p-2 z-50">
+              <div className="mb-2 text-xs text-slate-300">
+                Restore hidden videos:
               </div>
               {hiddenVideos.map((filename) => (
                 <button
                   key={filename}
-                  className="block w-full text-left px-2 py-1 rounded-md text-xs text-slate-300 hover:text-slate-100 hover:bg-white/5 transition-colors"
+                  className="block w-full text-left px-2 py-1 rounded hover:bg-slate-700 text-slate-100"
                   onClick={() =>
                     setHiddenVideos((prev) =>
                       prev.filter((v) => v !== filename),
@@ -347,6 +258,7 @@ export const SimpleVideosPlayer = ({
           if (hiddenVideos.includes(info.filename)) return null;
 
           const isEnlarged = enlargedVideo === info.filename;
+          const isFirstVisible = idx === firstVisibleIdx;
 
           return (
             <div
@@ -357,74 +269,52 @@ export const SimpleVideosPlayer = ({
                   : "max-w-96"
               }`}
             >
-              <p className="truncate w-full rounded-t-md bg-[var(--surface-1)] border border-b-0 border-white/5 px-2.5 py-1 text-[11px] text-slate-400 flex items-center justify-between gap-2">
-                <span className="truncate">{info.filename}</span>
-                <span className="flex gap-0.5 shrink-0">
+              <p className="truncate w-full rounded-t-xl bg-gray-800 px-2 text-sm text-gray-300 flex items-center justify-between">
+                <span>{info.filename}</span>
+                <span className="flex gap-1">
                   <button
                     title={isEnlarged ? "Minimize" : "Enlarge"}
-                    className="p-1 rounded text-slate-500 hover:text-slate-200 hover:bg-white/5 transition-colors"
+                    className="ml-2 p-1 hover:bg-slate-700 rounded"
                     onClick={() =>
                       setEnlargedVideo(isEnlarged ? null : info.filename)
                     }
                   >
-                    {isEnlarged ? (
-                      <FaCompress size={10} />
-                    ) : (
-                      <FaExpand size={10} />
-                    )}
+                    {isEnlarged ? <FaCompress /> : <FaExpand />}
                   </button>
                   <button
                     title="Hide Video"
-                    className="p-1 rounded text-slate-500 hover:text-slate-200 hover:bg-white/5 transition-colors disabled:opacity-30 disabled:hover:bg-transparent"
-                    onClick={() => {
-                      setHiddenVideos((prev) => [...prev, info.filename]);
-                      // If the user hid the camera that was enlarged, clear
-                      // the enlarged state too — otherwise it stays pointed
-                      // at the now-hidden filename and pops back to fullscreen
-                      // the moment the user un-hides it.
-                      if (enlargedVideo === info.filename) {
-                        setEnlargedVideo(null);
-                      }
-                    }}
+                    className="ml-1 p-1 hover:bg-slate-700 rounded"
+                    onClick={() =>
+                      setHiddenVideos((prev) => [...prev, info.filename])
+                    }
                     disabled={
                       videosInfo.filter(
                         (v) => !hiddenVideos.includes(v.filename),
                       ).length === 1
                     }
                   >
-                    <FaTimes size={10} />
+                    <FaTimes />
                   </button>
                 </span>
               </p>
-              <div className="relative w-full">
-                <video
-                  ref={videoRefCallbacksRef.current[idx]}
-                  className={`w-full object-contain ${
-                    isEnlarged ? "max-h-[90vh] max-w-[90vw]" : ""
-                  } ${info.isGrayscale ? "opacity-0" : ""}`}
-                  muted
-                  preload="auto"
-                  crossOrigin="anonymous"
-                >
-                  <source src={proxyHfUrl(info.url)} type="video/mp4" />
-                  Your browser does not support the video tag.
-                </video>
-                {/* Grayscale feeds: the hidden <video> above still decodes and
-                    drives timing; this canvas paints its frames recolored with
-                    the viridis colormap. */}
-                <ColormappedVideo
-                  videoEl={videoEls[idx] ?? null}
-                  active={info.isGrayscale}
-                  range={info.colormapRange}
-                />
-                {/* VQA bbox/keypoint overlay. Reads atoms + drawMode from
-                    AnnotationsContext; pointer-events fall through when
-                    not in draw mode so video controls remain usable. */}
-                <VideoOverlayCanvas
-                  videoEl={videoEls[idx] ?? null}
-                  cameraKey={info.filename}
-                />
-              </div>
+              <video
+                ref={(el: HTMLVideoElement | null) => {
+                  videoRefs.current[idx] = el;
+                }}
+                className={`w-full object-contain ${
+                  isEnlarged ? "max-h-[90vh] max-w-[90vw]" : ""
+                }`}
+                muted
+                preload="auto"
+                crossOrigin="anonymous"
+                onPlay={(e) => handlePlay(e.currentTarget, info)}
+                onTimeUpdate={
+                  isFirstVisible ? makeTimeUpdateHandler(idx) : undefined
+                }
+              >
+                <source src={info.url} type="video/mp4" />
+                Your browser does not support the video tag.
+              </video>
             </div>
           );
         })}
