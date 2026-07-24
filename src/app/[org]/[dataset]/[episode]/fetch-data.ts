@@ -1412,13 +1412,21 @@ async function loadEpisodeMetadataV3Simple(
   version: string,
   episodeId: number,
 ): Promise<EpisodeMetadataV3> {
+  const foundEpisodes: number[] = [];
   for await (const rows of iterateEpisodeMetadataFilesV3(repoId, version)) {
     for (const row of rows) {
-      if (parseEpisodeRowSimple(row).episode_index === episodeId) {
-        return parseEpisodeRowSimple(row);
+      const parsed = parseEpisodeRowSimple(row);
+      foundEpisodes.push(parsed.episode_index);
+      if (parsed.episode_index === episodeId) {
+        return parsed;
       }
     }
   }
+  console.error(
+    `[loadEpisodeMetadataV3Simple] Episode ${episodeId} not found. Available episodes:`,
+    foundEpisodes.slice(0, 10),
+    `(showing first 10 of ${foundEpisodes.length})`,
+  );
   throw new Error(`Episode ${episodeId} not found in metadata`);
 }
 

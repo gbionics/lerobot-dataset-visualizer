@@ -207,5 +207,8 @@ export function buildVersionedUrl(
   version: string,
   path: string,
 ): string {
+  if (isLocalMode()) {
+    return buildLocalUrl(repoId, path);
+  }
   return `${DATASET_URL}/${repoId}/resolve/main/${path}`;
 }
