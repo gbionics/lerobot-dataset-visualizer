@@ -1,23 +1,24 @@
 "use client";
 
-import { useState, useEffect, useRef, lazy, Suspense } from "react";
+import {
+  useState,
+  useEffect,
+  useRef,
+  lazy,
+  Suspense,
+  useCallback,
+} from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { postParentMessageWithParams } from "@/utils/postParentMessage";
 import { SimpleVideosPlayer } from "@/components/simple-videos-player";
+import DataRecharts from "@/components/data-recharts";
 import PlaybackBar from "@/components/playback-bar";
 import { TimeProvider, useTime } from "@/context/time-context";
 import { FlaggedEpisodesProvider } from "@/context/flagged-episodes-context";
-import {
-  AnnotationsProvider,
-  useAnnotations,
-} from "@/context/annotations-context";
-import { AnnotationsPanel } from "@/components/annotations-panel";
-import { AnnotationsTimeline } from "@/components/annotations-timeline";
 import Sidebar from "@/components/side-nav";
 import StatsPanel from "@/components/stats-panel";
 import OverviewPanel from "@/components/overview-panel";
 import Loading from "@/components/loading-component";
-import HfAuthButton from "@/components/hf-auth-button";
 import { hasURDFSupport } from "@/lib/so101-robot";
 import {
   getAdjacentEpisodesVideoInfo,
@@ -40,104 +41,23 @@ const ActionInsightsPanel = lazy(
   () => import("@/components/action-insights-panel"),
 );
 const FilteringPanel = lazy(() => import("@/components/filtering-panel"));
-// Recharts is ~150KB gz and not above-the-fold (videos render first on the
-// Episodes tab). Lazy-load it so the initial chunk can ship faster and
-// videos start downloading in parallel with the chart bundle.
-const DataRecharts = lazy(() => import("@/components/data-recharts"));
+const AnomaliesPanel = lazy(() => import("@/components/anomalies-panel"));
 
-/** Skip global playback / navigation shortcuts while typing in a field. */
-function isKeyboardFocusInsideTextEntry(target: EventTarget | null): boolean {
-  if (!(target instanceof HTMLElement)) return false;
-  if (target.isContentEditable || target.closest('[contenteditable="true"]')) {
-    return true;
-  }
-  const tag = target.tagName;
-  return (
-    tag === "TEXTAREA" ||
-    tag === "SELECT" ||
-    tag === "INPUT" ||
-    tag === "BUTTON" ||
-    (tag === "A" && target.hasAttribute("href"))
-  );
-}
+import type {
+  DatasetAnomaliesData,
+  EpisodeAnomalyStats,
+} from "@/components/anomalies-panel";
+import type { AnomaliesData } from "@/components/urdf-viewer";
+import { computeEpisodeAnomalies } from "@/utils/anomalyDetection";
 
 type ActiveTab =
   | "episodes"
-  | "annotations"
   | "statistics"
   | "frames"
   | "insights"
   | "filtering"
-  | "doctor"
+  | "anomalies"
   | "urdf";
-
-// Subscribes to `currentTime` so its parent doesn't have to. Keeping this
-// in a leaf component means the throttled time ticks (~12.5/s during
-// playback) only re-render this no-op sub-tree, not the entire 700-line
-// EpisodeViewerInner. Vercel rule: rerender-defer-reads.
-function UrlTimeSync() {
-  const { currentTime, isPlaying } = useTime();
-  const searchParams = useSearchParams();
-  const lastUrlSecondRef = useRef<number>(-1);
-
-  // Only update the URL ?t= param when the integer second changes, and
-  // only while paused — replacing state every frame during playback would
-  // spam the browser's history.
-  useEffect(() => {
-    if (isPlaying) return;
-    const currentSec = Math.floor(currentTime);
-    if (currentTime > 0 && lastUrlSecondRef.current !== currentSec) {
-      lastUrlSecondRef.current = currentSec;
-      const newParams = new URLSearchParams(searchParams.toString());
-      newParams.set("t", currentSec.toString());
-      window.history.replaceState(
-        {},
-        "",
-        `${window.location.pathname}?${newParams.toString()}`,
-      );
-      postParentMessageWithParams((params: URLSearchParams) => {
-        params.set("path", window.location.pathname + window.location.search);
-      });
-    }
-  }, [isPlaying, currentTime, searchParams]);
-
-  return null;
-}
-
-// Hoisted to module scope. Defining inside EpisodeViewerInner created a new
-// component type on every parent render — and the parent re-renders ~12.5×/s
-// during playback because it consumes `currentTime` from useTime. React
-// would unmount and remount every tab on every tick.
-function TabButton({
-  active,
-  onClick,
-  label,
-  title,
-}: {
-  active: boolean;
-  onClick: () => void;
-  label: string;
-  title?: string;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      title={title}
-      className={`relative px-5 py-3 text-xs font-medium tracking-wide uppercase transition-colors ${
-        active ? "text-cyan-300" : "text-slate-400 hover:text-slate-100"
-      }`}
-    >
-      {label}
-      <span
-        className={`pointer-events-none absolute bottom-0 left-3 right-3 h-px transition-all ${
-          active
-            ? "bg-cyan-400 shadow-[0_0_8px_rgba(56,189,248,0.55)]"
-            : "bg-transparent"
-        }`}
-      />
-    </button>
-  );
-}
 
 export default function EpisodeViewer({
   org,
@@ -181,12 +101,10 @@ export default function EpisodeViewer({
 
   if (error) {
     return (
-      <div className="flex h-screen items-center justify-center bg-[var(--bg)] text-red-300">
-        <div className="panel-raised max-w-xl p-6 border-red-500/40">
-          <h2 className="text-xl font-medium mb-3">Something went wrong</h2>
-          <p className="text-sm font-mono whitespace-pre-wrap text-red-200/90">
-            {error}
-          </p>
+      <div className="flex h-screen items-center justify-center bg-slate-950 text-red-400">
+        <div className="max-w-xl p-8 rounded bg-slate-900 border border-red-500 shadow-lg">
+          <h2 className="text-2xl font-bold mb-4">Something went wrong</h2>
+          <p className="text-lg font-mono whitespace-pre-wrap mb-4">{error}</p>
         </div>
       </div>
     );
@@ -194,7 +112,7 @@ export default function EpisodeViewer({
 
   if (!data) {
     return (
-      <div className="relative h-screen bg-[var(--bg)]">
+      <div className="relative h-screen bg-slate-950">
         <Loading />
       </div>
     );
@@ -203,33 +121,10 @@ export default function EpisodeViewer({
   return (
     <TimeProvider duration={data!.duration}>
       <FlaggedEpisodesProvider>
-        <AnnotationsProvider>
-          <EpisodeBootstrap data={data!} />
-          <EpisodeViewerInner data={data!} org={org} dataset={dataset} />
-        </AnnotationsProvider>
+        <EpisodeViewerInner data={data!} org={org} dataset={dataset} />
       </FlaggedEpisodesProvider>
     </TimeProvider>
   );
-}
-
-/** Wires the loaded episode into the AnnotationsProvider. */
-function EpisodeBootstrap({ data }: { data: EpisodeData }) {
-  const { setEpisode } = useAnnotations();
-  useEffect(() => {
-    setEpisode(
-      data.episodeId,
-      { repoId: data.datasetInfo.repoId },
-      data.languageAtoms,
-      data.frameTimestamps,
-    );
-  }, [
-    data.episodeId,
-    data.datasetInfo.repoId,
-    data.languageAtoms,
-    data.frameTimestamps,
-    setEpisode,
-  ]);
-  return null;
 }
 
 function EpisodeViewerInner({
@@ -258,29 +153,8 @@ function EpisodeViewerInner({
   const router = useRouter();
   const searchParams = useSearchParams();
 
-  // Tab state & lazy stats — read sessionStorage in the initializer so the
-  // correct tab renders on the very first frame (no post-mount flash).
-  // Safe because EpisodeViewerInner only mounts client-side (behind a loading gate).
-  const [activeTab, setActiveTab] = useState<ActiveTab>(() => {
-    if (typeof window !== "undefined") {
-      const stored = sessionStorage.getItem("activeTab");
-      if (
-        stored &&
-        [
-          "episodes",
-          "annotations",
-          "statistics",
-          "frames",
-          "insights",
-          "filtering",
-          "urdf",
-        ].includes(stored)
-      ) {
-        return stored as ActiveTab;
-      }
-    }
-    return "episodes";
-  });
+  // Tab state & lazy stats
+  const [activeTab, setActiveTab] = useState<ActiveTab>("episodes");
   const isLoading = activeTab === "episodes" && (!videosReady || !chartsReady);
 
   useEffect(() => {
@@ -299,20 +173,24 @@ function EpisodeViewerInner({
     useState<EpisodeFramesData | null>(null);
   const [framesLoading, setFramesLoading] = useState(false);
   const framesLoadedRef = useRef(false);
-  const [framesFlaggedOnly, setFramesFlaggedOnly] = useState(() =>
-    typeof window !== "undefined"
-      ? sessionStorage.getItem("framesFlaggedOnly") === "true"
-      : false,
-  );
-  const [sidebarFlaggedOnly, setSidebarFlaggedOnly] = useState(() =>
-    typeof window !== "undefined"
-      ? sessionStorage.getItem("sidebarFlaggedOnly") === "true"
-      : false,
-  );
+  const [framesFlaggedOnly, setFramesFlaggedOnly] = useState(false);
+  const [sidebarFlaggedOnly, setSidebarFlaggedOnly] = useState(false);
   const [crossEpData, setCrossEpData] =
     useState<CrossEpisodeVarianceData | null>(null);
   const [insightsLoading, setInsightsLoading] = useState(false);
   const insightsLoadedRef = useRef(false);
+  const [anomaliesData, setAnomaliesData] = useState<AnomaliesData | null>(
+    null,
+  );
+  const [anomaliesLoading, setAnomaliesLoading] = useState(false);
+  const [datasetAnomalies, setDatasetAnomalies] =
+    useState<DatasetAnomaliesData | null>(null);
+  const [datasetAnomaliesLoading, setDatasetAnomaliesLoading] = useState(false);
+  const datasetAnomaliesLoadedRef = useRef(false);
+  const [computingAllProgress, setComputingAllProgress] = useState<{
+    current: number;
+    total: number;
+  } | null>(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -326,9 +204,12 @@ function EpisodeViewerInner({
     statsLoadedRef.current = false;
     framesLoadedRef.current = false;
     insightsLoadedRef.current = false;
+    datasetAnomaliesLoadedRef.current = false;
     setEpisodeLengthStats(null);
     setEpisodeFramesData(null);
     setCrossEpData(null);
+    setAnomaliesData(null);
+    setDatasetAnomalies(null);
   }, [datasetInfo.repoId]);
 
   // Eagerly load the URDFViewer bundle + warm the STL geometry cache while
@@ -342,14 +223,39 @@ function EpisodeViewerInner({
     }
   }, [datasetInfo.robot_type, datasetInfo.codebase_version]);
 
-  // Persist UI state across episode navigations. One effect instead of
-  // three near-identical writes — fewer commit hooks per render and the
-  // intent (mirror three primitives to sessionStorage) reads as one unit.
+  // Hydrate UI state from sessionStorage after mount (avoids SSR/client mismatch)
+  useEffect(() => {
+    const stored = sessionStorage.getItem("activeTab");
+    if (
+      stored &&
+      [
+        "episodes",
+        "statistics",
+        "frames",
+        "insights",
+        "filtering",
+        "anomalies",
+        "urdf",
+      ].includes(stored)
+    ) {
+      setActiveTab(stored as ActiveTab);
+    }
+    if (sessionStorage.getItem("framesFlaggedOnly") === "true")
+      setFramesFlaggedOnly(true);
+    if (sessionStorage.getItem("sidebarFlaggedOnly") === "true")
+      setSidebarFlaggedOnly(true);
+  }, []);
+
+  // Persist UI state across episode navigations
   useEffect(() => {
     sessionStorage.setItem("activeTab", activeTab);
+  }, [activeTab]);
+  useEffect(() => {
     sessionStorage.setItem("sidebarFlaggedOnly", String(sidebarFlaggedOnly));
+  }, [sidebarFlaggedOnly]);
+  useEffect(() => {
     sessionStorage.setItem("framesFlaggedOnly", String(framesFlaggedOnly));
-  }, [activeTab, sidebarFlaggedOnly, framesFlaggedOnly]);
+  }, [framesFlaggedOnly]);
 
   const loadStats = () => {
     if (statsLoadedRef.current) return;
@@ -426,6 +332,202 @@ function EpisodeViewerInner({
       });
   };
 
+  // Cache for per-episode anomalies (computed when viewing episodes in URDF viewer)
+  const episodeAnomaliesCache = useRef<Map<number, AnomaliesData>>(new Map());
+
+  const loadDatasetAnomalies = useCallback(() => {
+    if (datasetAnomaliesLoadedRef.current) return;
+    datasetAnomaliesLoadedRef.current = true;
+    setDatasetAnomaliesLoading(true);
+
+    // Note: This aggregates already-computed anomaly data from the cache
+    // Computing anomalies for ALL episodes would require loading URDF for each,
+    // which is very expensive. Users should view episodes in 3D Replay first.
+
+    const episodeStats: EpisodeAnomalyStats[] = [];
+    const jointViolationCounts = new Map<string, number>();
+    let totalViolationsAcrossAll = 0;
+    let episodesWithViolations = 0;
+
+    for (const [
+      episodeId,
+      anomalyData,
+    ] of episodeAnomaliesCache.current.entries()) {
+      if (!anomalyData) continue;
+
+      const totalViolations = anomalyData.frameAnomalies.reduce(
+        (sum: number, fa) => sum + fa.violations.length,
+        0,
+      );
+
+      if (totalViolations > 0) {
+        episodesWithViolations++;
+        totalViolationsAcrossAll += totalViolations;
+
+        const affectedJoints = Array.from(
+          anomalyData.affectedJoints.keys(),
+        ) as string[];
+
+        episodeStats.push({
+          episodeId,
+          totalViolations,
+          framesWithViolations: anomalyData.frameAnomalies.length,
+          totalFrames: anomalyData.totalFrames,
+          violationRate:
+            (anomalyData.frameAnomalies.length / anomalyData.totalFrames) * 100,
+          affectedJoints,
+        });
+
+        // Aggregate joint violations
+        for (const [jointName, count] of anomalyData.affectedJoints.entries()) {
+          jointViolationCounts.set(
+            jointName,
+            (jointViolationCounts.get(jointName) || 0) + count,
+          );
+        }
+      }
+    }
+
+    const datasetData: DatasetAnomaliesData = {
+      episodeStats,
+      totalEpisodes: episodes.length,
+      episodesWithViolations,
+      totalViolationsAcrossAll,
+      mostAffectedJoints: jointViolationCounts,
+    };
+
+    setDatasetAnomalies(datasetData);
+    setDatasetAnomaliesLoading(false);
+  }, [episodes.length]);
+
+  const computeAllEpisodes = useCallback(() => {
+    // Check if user really wants to do this expensive operation
+    const remaining = episodes.length - episodeAnomaliesCache.current.size;
+    if (remaining === 0) {
+      alert("All episodes have already been analyzed!");
+      return;
+    }
+
+    const confirmed = window.confirm(
+      `This will analyze ${remaining} remaining episodes.\n\n` +
+        `This requires loading URDF model and dataset for each episode, ` +
+        `which may take several minutes and use significant memory.\n\n` +
+        `Alternatively, you can navigate through episodes in the 3D Replay tab ` +
+        `to analyze them one at a time.\n\nContinue with full analysis?`,
+    );
+
+    if (!confirmed) return;
+
+    // Ensure we have required params
+    if (!org || !dataset) {
+      alert("Missing organization or dataset information");
+      return;
+    }
+
+    // Start async computation
+    (async () => {
+      try {
+        setComputingAllProgress({ current: 0, total: episodes.length });
+        let analyzed = 0;
+
+        for (let i = 0; i < episodes.length; i++) {
+          const episodeId = episodes[i];
+
+          // Skip invalid episode IDs
+          if (episodeId === undefined) continue;
+
+          // Skip if already cached
+          if (episodeAnomaliesCache.current.has(episodeId)) {
+            analyzed++;
+            setComputingAllProgress({
+              current: analyzed,
+              total: episodes.length,
+            });
+            continue;
+          }
+
+          try {
+            // Load episode data
+            const result = await getEpisodeDataSafe(org, dataset, episodeId);
+
+            if (result.error || !result.data) {
+              console.warn(
+                `Failed to load episode ${episodeId}:`,
+                result.error || "No data",
+              );
+              analyzed++;
+              setComputingAllProgress({
+                current: analyzed,
+                total: episodes.length,
+              });
+              continue;
+            }
+
+            // Compute anomalies (skip if no robot type info)
+            if (!datasetInfo.robot_type) {
+              console.warn(`No robot type for episode ${episodeId}`);
+              analyzed++;
+              setComputingAllProgress({
+                current: analyzed,
+                total: episodes.length,
+              });
+              continue;
+            }
+
+            const anomalies = await computeEpisodeAnomalies(
+              episodeId,
+              result.data,
+              datasetInfo.robot_type,
+            );
+
+            if (anomalies) {
+              episodeAnomaliesCache.current.set(episodeId, anomalies);
+            }
+
+            analyzed++;
+            setComputingAllProgress({
+              current: analyzed,
+              total: episodes.length,
+            });
+
+            // Add small delay to prevent blocking UI
+            if (analyzed % 5 === 0) {
+              await new Promise((resolve) => setTimeout(resolve, 10));
+            }
+          } catch (error) {
+            console.error(`Error analyzing episode ${episodeId}:`, error);
+            analyzed++;
+            setComputingAllProgress({
+              current: analyzed,
+              total: episodes.length,
+            });
+          }
+        }
+
+        // Done - update dataset anomalies
+        setComputingAllProgress(null);
+        datasetAnomaliesLoadedRef.current = false;
+        loadDatasetAnomalies();
+      } catch (error) {
+        console.error("Error during full dataset analysis:", error);
+        setComputingAllProgress(null);
+        alert("An error occurred during analysis. Check console for details.");
+      }
+    })();
+  }, [episodes, org, dataset, datasetInfo, loadDatasetAnomalies]);
+
+  // Update cache when anomalies are computed
+  useEffect(() => {
+    if (anomaliesData && anomaliesData.episodeId) {
+      episodeAnomaliesCache.current.set(anomaliesData.episodeId, anomaliesData);
+      // If dataset view is active and already loaded, update it
+      if (datasetAnomaliesLoadedRef.current) {
+        datasetAnomaliesLoadedRef.current = false;
+        loadDatasetAnomalies();
+      }
+    }
+  }, [anomaliesData, loadDatasetAnomalies]);
+
   // Re-trigger data loading for the restored tab on mount
   useEffect(() => {
     if (activeTab === "statistics") loadStats();
@@ -434,6 +536,9 @@ function EpisodeViewerInner({
     if (activeTab === "filtering") {
       loadStats();
       loadInsights();
+    }
+    if (activeTab === "urdf" || activeTab === "anomalies") {
+      if (!anomaliesData) setAnomaliesLoading(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -447,14 +552,14 @@ function EpisodeViewerInner({
       loadStats();
       loadInsights();
     }
+    if (tab === "urdf" || tab === "anomalies") {
+      // Anomalies will be computed by URDFViewer when it loads
+      if (!anomaliesData) setAnomaliesLoading(true);
+    }
   };
 
-  // `currentTime` is intentionally NOT read here. Subscribing to it would
-  // re-render this 700-line component every ~80ms during playback. The
-  // <UrlTimeSync /> child handles its only consumer (the ?t= URL writer).
-  // `seek` and `setIsPlaying` are stable references from useCallback /
-  // useState — they don't drive renders.
-  const { seek, setIsPlaying } = useTime();
+  // Use context for time sync
+  const { currentTime, setCurrentTime, setIsPlaying, isPlaying } = useTime();
 
   // URDFViewer episode changer and play toggle — populated by URDFViewer on mount
   const urdfChangerRef = useRef<((ep: number) => void) | undefined>(undefined);
@@ -502,10 +607,10 @@ function EpisodeViewerInner({
     if (timeParam) {
       const timeValue = parseFloat(timeParam);
       if (!isNaN(timeValue)) {
-        seek(timeValue);
+        setCurrentTime(timeValue);
       }
     }
-  }, [searchParams, seek]);
+  }, [searchParams, setCurrentTime]);
 
   // sync with parent window hf.co/spaces
   useEffect(() => {
@@ -514,55 +619,33 @@ function EpisodeViewerInner({
     });
   }, []);
 
-  // Initialize page based on the current episode. Splitting this out from
-  // the keyboard listener effect lets the listener attach exactly once.
-  useEffect(() => {
-    const episodeIndex = episodes.indexOf(episodeId);
-    if (episodeIndex !== -1) {
-      setCurrentPage(Math.floor(episodeIndex / pageSize) + 1);
-    }
-  }, [episodes, episodeId, pageSize]);
-
-  // Mirror the values the keydown handler needs into a ref. Without this,
-  // `useCallback` would produce a new handler whenever `activeTab` /
-  // `episodeId` / `urdfEpisode` changed, and the keydown effect would
-  // detach + reattach the listener each time. Now the listener attaches
-  // once and reads the latest state via the ref.
-  // Vercel rule: advanced-event-handler-refs.
-  const keyStateRef = useRef({ activeTab, episodeId, episodes, urdfEpisode });
-  keyStateRef.current = { activeTab, episodeId, episodes, urdfEpisode };
-
-  useEffect(() => {
-    const onKeyDown = (e: KeyboardEvent) => {
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent) => {
       const { key } = e;
-      const s = keyStateRef.current;
-      const inTextEntry = isKeyboardFocusInsideTextEntry(e.target);
 
       if (key === " ") {
-        if (inTextEntry) return;
         e.preventDefault();
-        if (s.activeTab === "urdf") {
+        if (activeTab === "urdf") {
           urdfPlayToggleRef.current?.();
         } else {
           setIsPlaying((prev: boolean) => !prev);
         }
       } else if (key === "ArrowDown" || key === "ArrowUp") {
-        if (inTextEntry) return;
         e.preventDefault();
-        if (s.activeTab === "urdf") {
+        if (activeTab === "urdf") {
           const nextEp =
-            key === "ArrowDown" ? s.urdfEpisode + 1 : s.urdfEpisode - 1;
-          const lowest = s.episodes[0];
-          const highest = s.episodes[s.episodes.length - 1];
+            key === "ArrowDown" ? urdfEpisode + 1 : urdfEpisode - 1;
+          const lowest = episodes[0];
+          const highest = episodes[episodes.length - 1];
           if (nextEp >= lowest && nextEp <= highest) {
             setUrdfEpisode(nextEp);
             urdfChangerRef.current?.(nextEp);
           }
         } else {
           const nextEpisodeId =
-            key === "ArrowDown" ? s.episodeId + 1 : s.episodeId - 1;
-          const lowestEpisodeId = s.episodes[0];
-          const highestEpisodeId = s.episodes[s.episodes.length - 1];
+            key === "ArrowDown" ? episodeId + 1 : episodeId - 1;
+          const lowestEpisodeId = episodes[0];
+          const highestEpisodeId = episodes[episodes.length - 1];
           if (
             nextEpisodeId >= lowestEpisodeId &&
             nextEpisodeId <= highestEpisodeId
@@ -571,12 +654,45 @@ function EpisodeViewerInner({
           }
         }
       }
-    };
+    },
+    [activeTab, episodeId, episodes, router, setIsPlaying, urdfEpisode],
+  );
 
-    window.addEventListener("keydown", onKeyDown);
-    return () => window.removeEventListener("keydown", onKeyDown);
-    // router / setIsPlaying are stable; the rest is read via keyStateRef.
-  }, [router, setIsPlaying]);
+  // Initialize based on URL time parameter
+  useEffect(() => {
+    // Initialize page based on current episode
+    const episodeIndex = episodes.indexOf(episodeId);
+    if (episodeIndex !== -1) {
+      setCurrentPage(Math.floor(episodeIndex / pageSize) + 1);
+    }
+
+    // Add keyboard event listener
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [episodes, episodeId, pageSize, handleKeyDown]);
+
+  // Only update URL ?t= param when the integer second changes
+  const lastUrlSecondRef = useRef<number>(-1);
+  useEffect(() => {
+    if (isPlaying) return;
+    const currentSec = Math.floor(currentTime);
+    if (currentTime > 0 && lastUrlSecondRef.current !== currentSec) {
+      lastUrlSecondRef.current = currentSec;
+      const newParams = new URLSearchParams(searchParams.toString());
+      newParams.set("t", currentSec.toString());
+      // Replace state instead of pushing to avoid navigation stack bloat
+      window.history.replaceState(
+        {},
+        "",
+        `${window.location.pathname}?${newParams.toString()}`,
+      );
+      postParentMessageWithParams((params: URLSearchParams) => {
+        params.set("path", window.location.pathname + window.location.search);
+      });
+    }
+  }, [isPlaying, currentTime, searchParams]);
 
   // Pagination functions
   const nextPage = () => {
@@ -591,53 +707,122 @@ function EpisodeViewerInner({
     }
   };
 
-  const renderTab = (tab: ActiveTab, label: string, title?: string) => (
-    <TabButton
-      active={activeTab === tab}
-      onClick={() => handleTabChange(tab)}
-      label={label}
-      title={title}
-    />
-  );
-
   return (
-    <div className="flex flex-col h-screen max-h-screen bg-[var(--bg)] text-[var(--text-primary)]">
-      <UrlTimeSync />
+    <div className="flex flex-col h-screen max-h-screen bg-slate-950 text-gray-200">
       {/* Top tab bar */}
-      <div className="flex items-center border-b border-white/5 bg-[var(--surface-0)] shrink-0">
-        {renderTab("episodes", "Episodes")}
-        {renderTab(
-          "annotations",
-          "Annotations",
-          "Edit subtask / plan / memory / interjection / VQA atoms (lerobot v3.1 schema)",
-        )}
+      <div className="flex items-center border-b border-slate-700 bg-slate-900 shrink-0">
+        <button
+          className={`px-6 py-2.5 text-sm font-medium transition-colors relative ${
+            activeTab === "episodes"
+              ? "text-orange-400"
+              : "text-slate-400 hover:text-slate-200"
+          }`}
+          onClick={() => handleTabChange("episodes")}
+        >
+          Episodes
+          {activeTab === "episodes" && (
+            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-orange-500" />
+          )}
+        </button>
+        <button
+          className={`px-6 py-2.5 text-sm font-medium transition-colors relative ${
+            activeTab === "statistics"
+              ? "text-orange-400"
+              : "text-slate-400 hover:text-slate-200"
+          }`}
+          onClick={() => handleTabChange("statistics")}
+        >
+          Statistics
+          {activeTab === "statistics" && (
+            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-orange-500" />
+          )}
+        </button>
+        <button
+          className={`px-6 py-2.5 text-sm font-medium transition-colors relative ${
+            activeTab === "filtering"
+              ? "text-orange-400"
+              : "text-slate-400 hover:text-slate-200"
+          }`}
+          onClick={() => handleTabChange("filtering")}
+        >
+          Filtering
+          {activeTab === "filtering" && (
+            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-orange-500" />
+          )}
+        </button>
+        <button
+          className={`px-6 py-2.5 text-sm font-medium transition-colors relative ${
+            activeTab === "frames"
+              ? "text-orange-400"
+              : "text-slate-400 hover:text-slate-200"
+          }`}
+          onClick={() => handleTabChange("frames")}
+        >
+          Frames
+          {activeTab === "frames" && (
+            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-orange-500" />
+          )}
+        </button>
+        <button
+          className={`px-6 py-2.5 text-sm font-medium transition-colors relative ${
+            activeTab === "insights"
+              ? "text-orange-400"
+              : "text-slate-400 hover:text-slate-200"
+          }`}
+          onClick={() => handleTabChange("insights")}
+        >
+          Action Insights
+          {activeTab === "insights" && (
+            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-orange-500" />
+          )}
+        </button>
         {hasURDFSupport(datasetInfo.robot_type) &&
-          datasetInfo.codebase_version >= "v3.0" &&
-          renderTab("urdf", "3D Replay")}
-        {renderTab("statistics", "Statistics")}
-        {renderTab("filtering", "Filtering")}
-        {renderTab("frames", "Frames")}
-        {renderTab("insights", "Action Insights")}
-        {renderTab(
-          "doctor",
-          "Doctor",
-          "Dataset quality diagnostics (powered by lerobot-doctor)",
-        )}
-        <div className="ml-auto">
-          <HfAuthButton variant="tab" />
-        </div>
+          datasetInfo.codebase_version >= "v3.0" && (
+            <>
+              <button
+                className={`px-6 py-2.5 text-sm font-medium transition-colors relative ${
+                  activeTab === "urdf"
+                    ? "text-orange-400"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+                onClick={() => handleTabChange("urdf")}
+              >
+                3D Replay
+                {activeTab === "urdf" && (
+                  <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-orange-500" />
+                )}
+              </button>
+              <button
+                className={`px-6 py-2.5 text-sm font-medium transition-colors relative ${
+                  activeTab === "anomalies"
+                    ? "text-orange-400"
+                    : "text-slate-400 hover:text-slate-200"
+                }`}
+                onClick={() => handleTabChange("anomalies")}
+              >
+                Anomalies
+                {activeTab === "anomalies" && (
+                  <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-orange-500" />
+                )}
+              </button>
+            </>
+          )}
       </div>
 
       {/* Body: sidebar + content */}
       <div className="flex flex-1 min-h-0">
-        {/* Sidebar — on Episodes and 3D Replay tabs */}
+        {/* Sidebar — on Episodes, 3D Replay, and Anomalies tabs */}
         {(activeTab === "episodes" ||
-          activeTab === "annotations" ||
-          activeTab === "urdf") && (
+          activeTab === "urdf" ||
+          activeTab === "anomalies") && (
           <Sidebar
             datasetInfo={datasetInfo}
             paginatedEpisodes={paginatedEpisodes}
-            episodeId={activeTab === "urdf" ? urdfEpisode : episodeId}
+            episodeId={
+              activeTab === "urdf" || activeTab === "anomalies"
+                ? urdfEpisode
+                : episodeId
+            }
             totalPages={totalPages}
             currentPage={currentPage}
             prevPage={prevPage}
@@ -645,14 +830,14 @@ function EpisodeViewerInner({
             showFlaggedOnly={sidebarFlaggedOnly}
             onShowFlaggedOnlyChange={setSidebarFlaggedOnly}
             onEpisodeSelect={
-              activeTab === "urdf"
+              activeTab === "urdf" || activeTab === "anomalies"
                 ? (ep) => {
                     setUrdfEpisode(ep);
                     urdfChangerRef.current?.(ep);
+                    setAnomaliesLoading(true);
+                    setAnomaliesData(null);
                   }
-                : activeTab === "annotations"
-                  ? (ep) => router.push(`./episode_${ep}`)
-                  : undefined
+                : undefined
             }
           />
         )}
@@ -665,32 +850,32 @@ function EpisodeViewerInner({
 
           {activeTab === "episodes" && (
             <>
-              <div className="flex items-center gap-4 mb-2">
+              <div className="flex items-center justify-start my-4">
                 <a
                   href="https://github.com/huggingface/lerobot"
                   target="_blank"
-                  className="block shrink-0 opacity-90 hover:opacity-100 transition-opacity"
+                  className="block"
                 >
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     src="https://github.com/huggingface/lerobot/raw/main/media/readme/lerobot-logo-thumbnail.png"
                     alt="LeRobot Logo"
-                    className="w-24"
+                    className="w-32"
                   />
                 </a>
 
-                <div className="min-w-0">
+                <div>
                   <a
                     href={`https://huggingface.co/datasets/${datasetInfo.repoId}`}
                     target="_blank"
-                    className="text-slate-200 hover:text-cyan-300 transition-colors"
                   >
-                    <p className="text-base font-medium truncate">
+                    <p className="text-lg font-semibold">
                       {datasetInfo.repoId}
                     </p>
                   </a>
-                  <p className="text-[10px] uppercase tracking-wide text-slate-500 mt-0.5 tabular">
-                    Episode · {episodeId}
+
+                  <p className="font-mono text-lg font-semibold">
+                    episode {episodeId}
                   </p>
                 </div>
               </div>
@@ -705,15 +890,19 @@ function EpisodeViewerInner({
 
               {/* Language Instruction */}
               {task && (
-                <div className="mb-6 panel p-4">
-                  <p className="text-[10px] uppercase tracking-wide text-slate-500">
-                    Language Instruction
+                <div className="mb-6 p-4 bg-slate-800 rounded-lg border border-slate-600">
+                  <p className="text-slate-300">
+                    <span className="font-semibold text-slate-100">
+                      Language Instruction:
+                    </span>
                   </p>
-                  <div className="mt-1.5 space-y-0.5 text-sm text-slate-200">
+                  <div className="mt-2 text-slate-300">
                     {task
                       .split("\n")
                       .map((instruction: string, index: number) => (
-                        <p key={index}>{instruction}</p>
+                        <p key={index} className="mb-1">
+                          {instruction}
+                        </p>
                       ))}
                   </div>
                 </div>
@@ -721,55 +910,14 @@ function EpisodeViewerInner({
 
               {/* Graph */}
               <div className="mb-4">
-                <Suspense fallback={null}>
-                  <DataRecharts
-                    data={chartDataGroups}
-                    onChartsReady={() => setChartsReady(true)}
-                  />
-                </Suspense>
+                <DataRecharts
+                  data={chartDataGroups}
+                  onChartsReady={() => setChartsReady(true)}
+                />
               </div>
 
               <PlaybackBar />
             </>
-          )}
-
-          {activeTab === "annotations" && (
-            <div className="annotations-skin flex flex-col gap-4">
-              <div className="flex items-center gap-3">
-                <p className="text-base font-medium text-slate-200 truncate">
-                  {datasetInfo.repoId}
-                </p>
-                <p className="text-[10px] uppercase tracking-wide text-slate-500 tabular">
-                  Episode · {episodeId}
-                </p>
-              </div>
-              {videosInfo.length > 0 && (
-                <SimpleVideosPlayer
-                  videosInfo={videosInfo}
-                  onVideosReady={() => setVideosReady(true)}
-                />
-              )}
-              <div className="grounding-intro">
-                <span className="section-kicker">Grounded VQA</span>
-                <ul>
-                  <li>
-                    Draw directly on the active video to create visual
-                    questions. Drag for a bounding box, click for a point. The
-                    camera is detected from the video you draw on.
-                  </li>
-                  <li>
-                    Drag on any video to add a bbox question. Click any video to
-                    add a keypoint question. Confirm the popup with <kbd>↵</kbd>
-                    , or cancel with <kbd>Esc</kbd>.
-                  </li>
-                </ul>
-              </div>
-              <PlaybackBar />
-              <AnnotationsTimeline duration={data.duration} />
-              <AnnotationsPanel
-                cameraKeys={videosInfo.map((v) => v.filename)}
-              />
-            </div>
           )}
 
           {activeTab === "statistics" && (
@@ -816,38 +964,6 @@ function EpisodeViewerInner({
             </Suspense>
           )}
 
-          {activeTab === "doctor" && (
-            <div className="flex flex-col h-full">
-              <div className="flex items-center justify-between px-1 pb-2 text-xs text-slate-400">
-                <span>
-                  Dataset quality diagnostics &mdash; powered by{" "}
-                  <a
-                    href="https://github.com/jashshah999/lerobot-doctor"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="underline hover:text-slate-200"
-                  >
-                    lerobot-doctor
-                  </a>
-                </span>
-                <a
-                  href={`https://jashshah999-lerobot-doctor.hf.space/?dataset=${org}/${dataset}`}
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  className="underline hover:text-slate-200"
-                >
-                  Open in new tab
-                </a>
-              </div>
-              <iframe
-                src={`https://jashshah999-lerobot-doctor.hf.space/?dataset=${org}/${dataset}`}
-                title="lerobot-doctor"
-                className="flex-1 w-full rounded border border-slate-700 bg-white"
-                sandbox="allow-scripts allow-same-origin allow-popups allow-forms"
-              />
-            </div>
-          )}
-
           {activeTab === "urdf" && (
             <Suspense fallback={<Loading />}>
               <URDFViewer
@@ -856,6 +972,24 @@ function EpisodeViewerInner({
                 dataset={dataset}
                 episodeChangerRef={urdfChangerRef}
                 playToggleRef={urdfPlayToggleRef}
+                onAnomaliesComputed={(anomalies) => {
+                  setAnomaliesData(anomalies);
+                  setAnomaliesLoading(false);
+                }}
+              />
+            </Suspense>
+          )}
+
+          {activeTab === "anomalies" && (
+            <Suspense fallback={<Loading />}>
+              <AnomaliesPanel
+                anomaliesData={anomaliesData}
+                loading={anomaliesLoading}
+                datasetAnomalies={datasetAnomalies}
+                datasetLoading={datasetAnomaliesLoading}
+                onLoadDatasetAnomalies={loadDatasetAnomalies}
+                onComputeAllEpisodes={computeAllEpisodes}
+                computingProgress={computingAllProgress}
               />
             </Suspense>
           )}

@@ -8,7 +8,7 @@ import React, {
   useCallback,
 } from "react";
 import { Canvas, useThree, useFrame } from "@react-three/fiber";
-import { OrbitControls, Grid, Html, Environment } from "@react-three/drei";
+import { OrbitControls, Grid, Html } from "@react-three/drei";
 import * as THREE from "three";
 import URDFLoader from "urdf-loader";
 import type { URDFRobot } from "urdf-loader";
@@ -24,6 +24,33 @@ import { CHART_CONFIG } from "@/utils/constants";
 import { getDatasetVersionAndInfo } from "@/utils/versionUtils";
 import type { DatasetMetadata } from "@/utils/parquetUtils";
 
+// Joint limit types
+interface JointLimit {
+  lower: number;
+  upper: number;
+}
+
+interface JointViolation {
+  jointName: string;
+  value: number;
+  lower: number;
+  upper: number;
+  columnName: string;
+}
+
+export interface FrameAnomaly {
+  frame: number;
+  timestamp: number;
+  violations: JointViolation[];
+}
+
+export interface AnomaliesData {
+  episodeId: number;
+  totalFrames: number;
+  frameAnomalies: FrameAnomaly[];
+  affectedJoints: Map<string, number>; // joint name -> violation count
+}
+
 const SERIES_DELIM = CHART_CONFIG.SERIES_NAME_DELIMITER;
 const DEG2RAD = Math.PI / 180;
 
@@ -33,25 +60,13 @@ const stlGeometryCache = new Map<string, THREE.BufferGeometry>();
 // In-flight promise cache — prevents duplicate simultaneous fetches
 const stlGeometryLoading = new Map<string, Promise<THREE.BufferGeometry>>();
 
-// URDFs + meshes are hosted in the Hub bucket at
-// https://huggingface.co/buckets/lerobot/robot-urdfs. URDFLoader resolves
-// relative mesh paths against the URDF's own URL, so the bucket layout
-// mirrors the upstream directory tree. Note: buckets don't have branches,
-// so the resolve URL has no "/main" segment.
-const URDF_BASE_URL =
-  process.env.NEXT_PUBLIC_URDF_BASE_URL ??
-  "https://huggingface.co/buckets/lerobot/robot-urdfs/resolve";
-
 function getRobotConfig(robotType: string | null) {
   const lower = (robotType ?? "").toLowerCase();
   if (lower.includes("g1") || lower.includes("unitree")) {
-    return { urdfUrl: `${URDF_BASE_URL}/g1/g1_body29_hand14.urdf`, scale: 1 };
+    return { urdfUrl: "/urdf/g1/g1_body29_hand14.urdf", scale: 1 };
   }
   if (lower.includes("openarm")) {
-    return {
-      urdfUrl: `${URDF_BASE_URL}/openarm/openarm_bimanual.urdf`,
-      scale: 3,
-    };
+    return { urdfUrl: "/urdf/openarm/openarm_bimanual.urdf", scale: 3 };
   }
   if (lower.includes("ergocub")) {
     return { urdfUrl: "/urdf/ergoCub/ergoCubSN002/model.urdf", scale: 1 };
@@ -240,17 +255,20 @@ function RobotScene({
   trailEnabled,
   trailResetKey,
   scale,
+  violatedJoints,
 }: {
   urdfUrl: string;
   jointValues: Record<string, number>;
-  onJointsLoaded: (names: string[]) => void;
+  onJointsLoaded: (names: string[], limits: Record<string, JointLimit>) => void;
   trailEnabled: boolean;
   trailResetKey: number;
   scale: number;
+  violatedJoints: Set<string>;
 }) {
-  const { scene, camera, controls, size } = useThree();
+  const { scene, size } = useThree();
   const robotRef = useRef<URDFRobot | null>(null);
   const tipLinksRef = useRef<THREE.Object3D[]>([]);
+  const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   type TrailState = {
@@ -318,104 +336,31 @@ function RobotScene({
   );
 
   useEffect(() => {
+    setLoading(true);
     setError(null);
     const isOpenArm = urdfUrl.includes("openarm");
     const isG1 = urdfUrl.includes("g1");
     const isErgoCub = urdfUrl.includes("ergoCub");
     const manager = new THREE.LoadingManager();
     const loader = new URDFLoader(manager);
-    // URDFLoader (node_modules/urdf-loader/src/URDFLoader.js ~line 556) does
-    //   `if (obj instanceof THREE.Mesh) obj.material = material;`
-    // on every mesh we hand back — overwriting our PBR material with the
-    // URDF's <material rgba="...">-derived MeshPhongMaterial. Wrapping the
-    // returned mesh in a Group dodges that check (same way DAE's collada.scene
-    // already avoids it) so our carefully-tuned materials survive.
-    const wrapForUrdf = (obj: THREE.Object3D): THREE.Object3D => {
-      const group = new THREE.Group();
-      group.add(obj);
-      return group;
-    };
     loader.loadMeshCb = (url, mgr, onLoad) => {
-      // DAE (Collada) files — ColladaLoader yields whatever the .dae author
-      // baked in: flat MeshPhongMaterial/MeshBasicMaterial colors plus, in
-      // OpenArm's case, ~23 per-file PointLight/SpotLight nodes. The stray
-      // lights caused the scene to look pure-white everywhere regardless of
-      // our own lighting, and the flat materials looked cartoonish. We strip
-      // both and rebuild every mesh with a MeshStandardMaterial bucketed into
-      // one of three archetypes (carbon-black, brushed metal, off-white paint)
-      // based on the original base-color lightness.
+      // DAE (Collada) files — load with embedded materials
       if (url.endsWith(".dae")) {
         const colladaLoader = new ColladaLoader(mgr);
         colladaLoader.load(
           url,
           (collada) => {
             if (isOpenArm) {
-              const strayLights: THREE.Object3D[] = [];
               collada.scene.traverse((child) => {
-                if (
-                  (child as THREE.Light).isLight &&
-                  !(child instanceof THREE.AmbientLight)
-                ) {
-                  strayLights.push(child);
-                }
-              });
-              for (const l of strayLights) l.parent?.remove(l);
-
-              collada.scene.traverse((child) => {
-                if (!(child instanceof THREE.Mesh) || !child.material) return;
-
-                const originals = Array.isArray(child.material)
-                  ? child.material
-                  : [child.material];
-
-                const rebuilt = originals.map((orig) => {
-                  const srcColor =
-                    (orig as THREE.MeshStandardMaterial).color ??
-                    new THREE.Color("#c0c4cc");
-                  const hsl = { h: 0, s: 0, l: 0 };
-                  srcColor.getHSL(hsl);
-
-                  // Archetype classification by original lightness.
-                  let color: THREE.Color;
-                  let metalness: number;
-                  let roughness: number;
-                  let envMapIntensity: number;
-                  if (hsl.l < 0.3) {
-                    // Carbon / anodised structural parts
-                    color = new THREE.Color().setHSL(hsl.h, 0.02, 0.09);
-                    metalness = 0.15;
-                    roughness = 0.75;
-                    envMapIntensity = 0.6;
-                  } else if (hsl.l < 0.7) {
-                    // Brushed metal joint collars / accents
-                    color = new THREE.Color().setHSL(hsl.h, 0.04, 0.42);
-                    metalness = 0.75;
-                    roughness = 0.35;
-                    envMapIntensity = 1.1;
-                  } else {
-                    // Off-white painted plates
-                    color = new THREE.Color().setHSL(hsl.h, 0.03, 0.6);
-                    metalness = 0.1;
-                    roughness = 0.5;
-                    envMapIntensity = 0.9;
+                if (child instanceof THREE.Mesh && child.material) {
+                  const mat = child.material as THREE.MeshStandardMaterial;
+                  if (mat.side !== undefined) mat.side = THREE.DoubleSide;
+                  if (mat.color) {
+                    const hsl = { h: 0, s: 0, l: 0 };
+                    mat.color.getHSL(hsl);
+                    if (hsl.l > 0.7) mat.color.setHSL(hsl.h, hsl.s, 0.55);
                   }
-
-                  const mat = new THREE.MeshStandardMaterial({
-                    color,
-                    metalness,
-                    roughness,
-                    envMapIntensity,
-                    side: THREE.DoubleSide,
-                  });
-                  orig.dispose?.();
-                  return mat;
-                });
-
-                child.material = Array.isArray(child.material)
-                  ? rebuilt
-                  : rebuilt[0];
-                child.castShadow = true;
-                child.receiveShadow = true;
+                }
               });
             }
             onLoad(collada.scene);
@@ -425,23 +370,11 @@ function RobotScene({
         );
         return;
       }
-      // STL files — apply final PBR materials directly here. We used to do a
-      // post-load archetype rebuild in manager.onLoad, but STLLoader calls
-      // `manager.itemEnd` *before* our Promise resolves — so when the last
-      // STL completes, manager.onLoad fires synchronously, our traverse runs,
-      // and THEN URDFLoader's inner `group.add(obj)` + `obj.material = urdf`
-      // runs in a microtask. Last-batch meshes ended up gold/green because
-      // they were added to the robot after our rebuild passed.
-      //
-      // Fix: pick the archetype color here, wrap the mesh in a Group so
-      // URDFLoader won't override our material (its override only triggers
-      // for direct `THREE.Mesh` instances), and skip the onLoad rebuild.
+      // STL files — apply custom materials, with module-level geometry cache
       const makeMesh = (geometry: THREE.BufferGeometry) => {
-        // Defaults: neutral off-white plastic, matches OpenArm "light" archetype
-        let color = "#9ba1ab";
+        let color = "#FFD700";
         let metalness = 0.1;
-        let roughness = 0.5;
-        let side: THREE.Side = THREE.FrontSide;
+        let roughness = 0.6;
         if (isG1) {
           const lower = url.toLowerCase();
           const isWhitePart =
@@ -451,19 +384,17 @@ function RobotScene({
             lower.includes("rubber") ||
             lower.includes("constraint") ||
             lower.includes("support");
-          color = isWhitePart ? "#9ca3af" : "#1f2937";
-          metalness = 0.25;
-          roughness = 0.6;
+          color = isWhitePart ? "#c0c0c0" : "#2a2a2a";
+          metalness = 0.3;
+          roughness = 0.5;
         } else if (url.includes("sts3215")) {
-          // SO-arm / any STL servo housing — carbon-black archetype
-          color = "#171a20";
-          metalness = 0.15;
-          roughness = 0.75;
+          color = "#1a1a1a";
+          metalness = 0.7;
+          roughness = 0.3;
         } else if (isOpenArm) {
           color = url.includes("body_link0") ? "#3a3a4a" : "#f5f5f5";
           metalness = 0.15;
           roughness = 0.6;
-          side = THREE.DoubleSide;
         } else if (isErgoCub) {
           color = "#c8c8d0";
           metalness = 0.25;
@@ -475,14 +406,14 @@ function RobotScene({
             color,
             metalness,
             roughness,
-            side,
+            side: isOpenArm ? THREE.DoubleSide : THREE.FrontSide,
           }),
         );
       };
 
       const cached = stlGeometryCache.get(url);
       if (cached) {
-        onLoad(wrapForUrdf(makeMesh(cached)));
+        onLoad(makeMesh(cached));
         return;
       }
 
@@ -499,52 +430,9 @@ function RobotScene({
         stlGeometryLoading.set(url, loading);
       }
       loading
-        .then((geometry) => onLoad(wrapForUrdf(makeMesh(geometry))))
+        .then((geometry) => onLoad(makeMesh(geometry)))
         .catch((err) => onLoad(new THREE.Object3D(), err as Error));
     };
-    // Materials are now set directly in loadMeshCb, so manager.onLoad only
-    // needs to (a) enable shadows, (b) auto-fit the camera. We defer the
-    // whole block one macrotask because STLLoader fires `manager.itemEnd`
-    // before the user callback runs, so if we worked synchronously here the
-    // last batch of meshes wouldn't yet be attached to the robot tree.
-    manager.onLoad = () => {
-      setTimeout(() => {
-        const robot = robotRef.current;
-        if (!robot) return;
-
-        robot.traverse((c) => {
-          c.castShadow = true;
-          if (!isOpenArm) c.receiveShadow = true;
-        });
-        robot.updateMatrixWorld(true);
-
-        // Auto-fit camera: URDFs can ship world→base offsets (SO-arm does)
-        // that put the robot far from origin, so a fixed camera pose crops
-        // the arm. Compute the world-space AABB and frame it.
-        const bbox = new THREE.Box3().setFromObject(robot);
-        if (!bbox.isEmpty()) {
-          const center = bbox.getCenter(new THREE.Vector3());
-          const sizeVec = bbox.getSize(new THREE.Vector3());
-          const maxDim = Math.max(sizeVec.x, sizeVec.y, sizeVec.z);
-          const fov =
-            ((camera as THREE.PerspectiveCamera).fov ?? 45) * (Math.PI / 180);
-          const distance = (maxDim / 2 / Math.tan(fov / 2)) * 1.6;
-          const dir = new THREE.Vector3(1, 0.85, 1).normalize();
-          camera.position.copy(center).addScaledVector(dir, distance);
-          camera.lookAt(center);
-          camera.updateProjectionMatrix();
-          const orbit = controls as unknown as {
-            target?: THREE.Vector3;
-            update?: () => void;
-          };
-          if (orbit?.target) {
-            orbit.target.copy(center);
-            orbit.update?.();
-          }
-        }
-      }, 0);
-    };
-
     if (isErgoCub) {
       loader.packages = { ergoCub: "/urdf/ergoCub/ergoCubSN002" };
     }
@@ -553,23 +441,12 @@ function RobotScene({
       (robot) => {
         robotRef.current = robot;
         robot.rotateOnAxis(new THREE.Vector3(1, 0, 0), -Math.PI / 2);
+        robot.traverse((c) => {
+          c.castShadow = true;
+        });
+        robot.updateMatrixWorld(true);
         robot.scale.set(scale, scale, scale);
         scene.add(robot);
-
-        // Fallback center/frame if manager.onLoad was starved (no async
-        // tracked loads — can happen if meshes are all cached synchronously).
-        const bbox = new THREE.Box3().setFromObject(robot);
-        if (!bbox.isEmpty()) {
-          const center = bbox.getCenter(new THREE.Vector3());
-          const orbit = controls as unknown as {
-            target?: THREE.Vector3;
-            update?: () => void;
-          };
-          if (orbit?.target) {
-            orbit.target.copy(center);
-            orbit.update?.();
-          }
-        }
 
         const tipNames = isG1
           ? G1_TIP_NAMES
@@ -594,12 +471,32 @@ function RobotScene({
               j.jointType === "prismatic",
           )
           .map((j) => j.name);
-        onJointsLoaded(movable);
+
+        // Extract joint limits
+        const limits: Record<string, JointLimit> = {};
+        for (const joint of Object.values(robot.joints)) {
+          if (
+            joint.jointType === "revolute" ||
+            joint.jointType === "continuous" ||
+            joint.jointType === "prismatic"
+          ) {
+            if (joint.limit) {
+              limits[joint.name] = {
+                lower: joint.limit.lower ?? -Infinity,
+                upper: joint.limit.upper ?? Infinity,
+              };
+            }
+          }
+        }
+
+        onJointsLoaded(movable, limits);
+        setLoading(false);
       },
       undefined,
       (err) => {
         console.error("Error loading URDF:", err);
         setError(String(err));
+        setLoading(false);
       },
     );
     return () => {
@@ -617,10 +514,40 @@ function RobotScene({
     const robot = robotRef.current;
     if (!robot) return;
 
+    // Set joint values
     for (const [name, value] of Object.entries(jointValues)) {
       robot.setJointValue(name, value);
     }
     robot.updateMatrixWorld(true);
+
+    // Highlight violated joints with emissive glow
+    // First, reset all materials
+    robot.traverse((obj) => {
+      if (obj instanceof THREE.Mesh && obj.material) {
+        const mat = obj.material as THREE.MeshStandardMaterial;
+        if (mat.emissive && mat.emissiveIntensity > 0) {
+          mat.emissive = new THREE.Color(0x000000);
+          mat.emissiveIntensity = 0;
+        }
+      }
+    });
+
+    // Then highlight violated joints
+    for (const jointName of violatedJoints) {
+      const joint = robot.joints[jointName];
+      if (joint && joint.children && joint.children.length > 0) {
+        // The first child of a joint is typically the link it controls
+        const childLink = joint.children[0];
+        childLink.traverse((obj: THREE.Object3D) => {
+          if (obj instanceof THREE.Mesh && obj.material) {
+            const mat = obj.material as THREE.MeshStandardMaterial;
+            // Apply red/amber emissive glow for violated joints
+            mat.emissive = new THREE.Color(0xff4400);
+            mat.emissiveIntensity = 0.8 + Math.sin(Date.now() / 200) * 0.2; // Pulsing effect
+          }
+        });
+      }
+    }
 
     const tips = tipLinksRef.current;
     if (!trailEnabled || tips.length === 0) {
@@ -676,9 +603,12 @@ function RobotScene({
     }
   });
 
-  // Loading state is rendered by the outer overlay (via urdfLoading) so we
-  // don't show two stacked spinners. The error state still surfaces inline
-  // since the overlay doesn't have an error path.
+  if (loading)
+    return (
+      <Html center>
+        <span className="text-white text-lg">Loading robot…</span>
+      </Html>
+    );
   if (error)
     return (
       <Html center>
@@ -739,12 +669,14 @@ export default function URDFViewer({
   dataset,
   episodeChangerRef,
   playToggleRef,
+  onAnomaliesComputed,
 }: {
   data: EpisodeData;
   org?: string;
   dataset?: string;
   episodeChangerRef?: React.RefObject<((ep: number) => void) | undefined>;
   playToggleRef?: React.RefObject<(() => void) | undefined>;
+  onAnomaliesComputed?: (anomalies: AnomaliesData | null) => void;
 }) {
   const { datasetInfo } = data;
   const fps = datasetInfo.fps || 30;
@@ -754,7 +686,6 @@ export default function URDFViewer({
   );
   const { urdfUrl, scale } = robotConfig;
   const isG1 = urdfUrl.includes("g1");
-  const isOpenArm = urdfUrl.includes("openarm");
   const repoId = org && dataset ? `${org}/${dataset}` : null;
   const datasetInfoRef = useRef<{
     version: string;
@@ -819,10 +750,16 @@ export default function URDFViewer({
 
   const totalFrames = chartData.length;
 
-  // URDF joint names
+  // URDF joint names and limits
   const [urdfJointNames, setUrdfJointNames] = useState<string[]>([]);
+  const [jointLimits, setJointLimits] = useState<Record<string, JointLimit>>(
+    {},
+  );
   const onJointsLoaded = useCallback(
-    (names: string[]) => setUrdfJointNames(names),
+    (names: string[], limits: Record<string, JointLimit>) => {
+      setUrdfJointNames(names);
+      setJointLimits(limits);
+    },
     [],
   );
 
@@ -875,22 +812,12 @@ export default function URDFViewer({
     [],
   );
 
-  // URDF meshes download async from the Hub bucket. Until joints are reported
-  // back from URDFLoader, playback/scrub inputs would drive an empty scene, so
-  // we gate interactions (and pause if already playing).
-  const urdfLoading = urdfJointNames.length === 0;
-
-  useEffect(() => {
-    if (urdfLoading) setPlaying(false);
-  }, [urdfLoading]);
-
   const handlePlayPause = useCallback(() => {
-    if (urdfLoading) return;
     setPlaying((prev) => {
       if (!prev) frameRef.current = frame;
       return !prev;
     });
-  }, [frame, urdfLoading]);
+  }, [frame]);
 
   useEffect(() => {
     if (playToggleRef) playToggleRef.current = handlePlayPause;
@@ -968,6 +895,160 @@ export default function URDFViewer({
     return values;
   }, [chartData, frame, gripperRanges, mapping, totalFrames, urdfJointNames]);
 
+  // Detect joint limit violations and create set for highlighting
+  const violatedJointsSet = useMemo(() => {
+    const violations = new Set<string>();
+    const tolerance = 0.001;
+
+    for (const [jointName, value] of Object.entries(jointValues)) {
+      const limit = jointLimits[jointName];
+      if (!limit) continue;
+
+      if (value < limit.lower - tolerance || value > limit.upper + tolerance) {
+        violations.add(jointName);
+      }
+    }
+    return violations;
+  }, [jointValues, jointLimits]);
+
+  // Compute violations for warning display
+  const jointViolations = useMemo(() => {
+    const violations: JointViolation[] = [];
+    for (const jointName of violatedJointsSet) {
+      const value = jointValues[jointName];
+      const limit = jointLimits[jointName];
+      if (limit && value !== undefined) {
+        const columnName = mapping[jointName] ?? jointName;
+        violations.push({
+          jointName,
+          value,
+          lower: limit.lower,
+          upper: limit.upper,
+          columnName,
+        });
+      }
+    }
+    return violations;
+  }, [violatedJointsSet, jointValues, jointLimits, mapping]);
+
+  // Compute all anomalies across all frames for the anomalies panel
+  const allAnomalies = useMemo(() => {
+    if (
+      totalFrames === 0 ||
+      urdfJointNames.length === 0 ||
+      Object.keys(jointLimits).length === 0 ||
+      Object.keys(mapping).filter((k) => mapping[k]).length === 0
+    ) {
+      return null;
+    }
+
+    const frameAnomalies: FrameAnomaly[] = [];
+    const affectedJoints = new Map<string, number>();
+    const tolerance = 0.001;
+
+    // Scan all frames
+    for (let frameIdx = 0; frameIdx < totalFrames; frameIdx++) {
+      const row = chartData[frameIdx];
+      const frameViolations: JointViolation[] = [];
+      const revoluteValues: number[] = [];
+      const revoluteNames: string[] = [];
+      const values: Record<string, number> = {};
+
+      // Compute joint values for this frame (same logic as jointValues)
+      for (const jn of urdfJointNames) {
+        if (jn.toLowerCase().includes("finger_joint2")) continue;
+        const col = mapping[jn];
+        if (!col || typeof row[col] !== "number") continue;
+        const raw = row[col];
+
+        if (jn.toLowerCase().includes("finger_joint1")) {
+          const range = gripperRanges[jn];
+          if (range) {
+            const t = (raw - range.min) / (range.max - range.min);
+            values[jn] = t * 0.044;
+          } else {
+            values[jn] = (raw / 100) * 0.044;
+          }
+        } else {
+          revoluteValues.push(raw);
+          revoluteNames.push(jn);
+        }
+      }
+
+      const converted = detectAndConvert(revoluteValues);
+      revoluteNames.forEach((n, i) => {
+        values[n] = converted[i];
+      });
+
+      // Copy finger_joint1 → finger_joint2
+      for (const jn of urdfJointNames) {
+        if (jn.toLowerCase().includes("finger_joint2")) {
+          const j1 = jn.replace(/finger_joint2/, "finger_joint1");
+          if (values[j1] !== undefined) values[jn] = values[j1];
+        }
+      }
+
+      // Check for violations
+      for (const [jointName, value] of Object.entries(values)) {
+        const limit = jointLimits[jointName];
+        if (!limit) continue;
+
+        if (
+          value < limit.lower - tolerance ||
+          value > limit.upper + tolerance
+        ) {
+          const columnName = mapping[jointName] ?? jointName;
+          frameViolations.push({
+            jointName,
+            value,
+            lower: limit.lower,
+            upper: limit.upper,
+            columnName,
+          });
+
+          // Track affected joints
+          affectedJoints.set(
+            jointName,
+            (affectedJoints.get(jointName) ?? 0) + 1,
+          );
+        }
+      }
+
+      // Record frame anomaly if any violations found
+      if (frameViolations.length > 0) {
+        const timestamp = row.timestamp ?? frameIdx / fps;
+        frameAnomalies.push({
+          frame: frameIdx,
+          timestamp: typeof timestamp === "number" ? timestamp : frameIdx / fps,
+          violations: frameViolations,
+        });
+      }
+    }
+
+    return {
+      episodeId: selectedEpisode,
+      totalFrames,
+      frameAnomalies,
+      affectedJoints,
+    };
+  }, [
+    chartData,
+    fps,
+    gripperRanges,
+    jointLimits,
+    mapping,
+    selectedEpisode,
+    totalFrames,
+    urdfJointNames,
+  ]);
+
+  // Notify parent when anomalies are computed
+  useEffect(() => {
+    if (onAnomaliesComputed) {
+      onAnomaliesComputed(allAnomalies);
+    }
+  }, [allAnomalies, onAnomaliesComputed]);
+
   if (data.flatChartData.length === 0) {
     return (
       <div className="text-slate-400 p-8 text-center">
@@ -979,72 +1060,28 @@ export default function URDFViewer({
   return (
     <div className="flex-1 flex flex-col overflow-hidden">
       {/* 3D Viewport */}
-      <div className="flex-1 min-h-0 bg-[var(--surface-0)] rounded-lg overflow-hidden border border-white/10 relative">
-        {(episodeLoading || urdfLoading) && (
-          <div className="absolute inset-0 z-10 flex items-center justify-center bg-[var(--bg)]/80">
+      <div className="flex-1 min-h-0 bg-slate-950 rounded-lg overflow-hidden border border-slate-700 relative">
+        {episodeLoading && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center bg-slate-950/70">
             <span className="text-white text-lg animate-pulse">
-              {urdfLoading
-                ? "Loading 3D model…"
-                : `Loading episode ${selectedEpisode}…`}
+              Loading episode {selectedEpisode}…
             </span>
           </div>
         )}
         <Canvas
-          shadows
           camera={{
             position: isG1
               ? [1.5, 1.0, 1.5]
-              : isOpenArm
-                ? [0.95 * scale, 0.8 * scale, 0.95 * scale]
-                : [0.3 * scale, 0.25 * scale, 0.3 * scale],
+              : [0.3 * scale, 0.25 * scale, 0.3 * scale],
             fov: 45,
             near: 0.01,
             far: 100,
           }}
-          gl={{
-            toneMapping: THREE.ACESFilmicToneMapping,
-            toneMappingExposure: 0.9,
-          }}
         >
-          <color attach="background" args={["#1a2433"]} />
-          {/* IBL: PMREM studio env gives mesh highlights somewhere to bounce */}
-          <Environment preset="studio" background={false} />
-          {/* 3-point studio rig — key is the only shadow caster */}
-          <ambientLight intensity={0.12} />
-          <directionalLight
-            color="#fff2e3"
-            position={[3, 5, 3]}
-            intensity={1.0}
-            castShadow
-            shadow-mapSize-width={2048}
-            shadow-mapSize-height={2048}
-            shadow-camera-near={0.1}
-            shadow-camera-far={15}
-            shadow-camera-left={-3}
-            shadow-camera-right={3}
-            shadow-camera-top={3}
-            shadow-camera-bottom={-3}
-            shadow-bias={-0.0005}
-          />
-          <directionalLight
-            color="#bfd9ff"
-            position={[-4, 2, -2]}
-            intensity={0.25}
-          />
-          <directionalLight
-            color="#ffffff"
-            position={[0, 3, -4]}
-            intensity={0.4}
-          />
-          {/* Ground-shadow catcher — invisible plane receives key-light shadow */}
-          <mesh
-            rotation={[-Math.PI / 2, 0, 0]}
-            position={[0, 0.001, 0]}
-            receiveShadow
-          >
-            <planeGeometry args={[10, 10]} />
-            <shadowMaterial opacity={0.35} />
-          </mesh>
+          <ambientLight intensity={0.7} />
+          <directionalLight position={[3, 5, 4]} intensity={1.5} />
+          <directionalLight position={[-2, 3, -2]} intensity={0.6} />
+          <hemisphereLight args={["#b1e1ff", "#666666", 0.5]} />
           <RobotScene
             urdfUrl={urdfUrl}
             jointValues={jointValues}
@@ -1052,6 +1089,7 @@ export default function URDFViewer({
             trailEnabled={trailEnabled}
             trailResetKey={selectedEpisode}
             scale={scale}
+            violatedJoints={violatedJointsSet}
           />
           <Grid
             args={[10, 10]}
@@ -1064,10 +1102,7 @@ export default function URDFViewer({
             fadeDistance={isG1 ? 20 : 10}
             position={[0, 0, 0]}
           />
-          <OrbitControls
-            makeDefault
-            target={isG1 ? [0, 0.5, 0] : [0, 0.8, 0]}
-          />
+          <OrbitControls target={isG1 ? [0, 0.5, 0] : [0, 0.8, 0]} />
           <PlaybackDriver
             playing={playing}
             fps={fps}
@@ -1079,7 +1114,49 @@ export default function URDFViewer({
       </div>
 
       {/* Controls */}
-      <div className="bg-[var(--surface-1)]/90 border-t border-white/10 p-3 space-y-3 shrink-0">
+      <div className="bg-slate-800/90 border-t border-slate-700 p-3 space-y-3 shrink-0">
+        {/* Joint Limit Violations Warning */}
+        {jointViolations.length > 0 && (
+          <div className="bg-amber-900/30 border border-amber-700/50 rounded-lg p-3">
+            <div className="flex items-start gap-2">
+              <span className="text-amber-400 text-lg shrink-0">⚠</span>
+              <div className="flex-1 min-w-0">
+                <h3 className="text-amber-300 font-semibold text-sm mb-1">
+                  Joint Limit Violations Detected
+                </h3>
+                <p className="text-amber-200/80 text-xs mb-2">
+                  {jointViolations.length} joint
+                  {jointViolations.length === 1 ? "" : "s"} exceed
+                  {jointViolations.length === 1 ? "s" : ""} URDF limits at frame{" "}
+                  {frame + 1} (highlighted in 3D view):
+                </p>
+                <div className="space-y-1 max-h-32 overflow-y-auto">
+                  {jointViolations.map((v) => (
+                    <div
+                      key={v.jointName}
+                      className="text-xs font-mono bg-slate-900/40 rounded px-2 py-1"
+                    >
+                      <span className="text-amber-300 font-semibold">
+                        {v.jointName}
+                      </span>
+                      <span className="text-slate-400 mx-1">→</span>
+                      <span className="text-white font-semibold">
+                        {v.value.toFixed(4)}
+                      </span>
+                      <span className="text-slate-500 ml-2">
+                        (limit: [{v.lower.toFixed(4)}, {v.upper.toFixed(4)}])
+                      </span>
+                      <div className="text-slate-400 text-xs mt-0.5">
+                        Column: {v.columnName.split(SERIES_DELIM).pop()}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+
         <UrdfPlaybackBar
           frame={frame}
           totalFrames={totalFrames}
@@ -1089,7 +1166,6 @@ export default function URDFViewer({
           trailEnabled={trailEnabled}
           onTrailToggle={() => setTrailEnabled((v) => !v)}
           onFrameChange={handleFrameChange}
-          disabled={urdfLoading}
         />
 
         {/* Collapsible joint mapping */}
@@ -1120,8 +1196,8 @@ export default function URDFViewer({
                     onClick={() => setSelectedGroup(name)}
                     className={`px-2 py-1 text-xs rounded transition-colors ${
                       selectedGroup === name
-                        ? "bg-cyan-500 text-white"
-                        : "bg-white/5 text-slate-300 hover:bg-white/5"
+                        ? "bg-orange-600 text-white"
+                        : "bg-slate-700 text-slate-300 hover:bg-slate-600"
                     }`}
                   >
                     {name}
@@ -1132,52 +1208,93 @@ export default function URDFViewer({
 
             <div className="flex-1 overflow-x-auto max-h-48 overflow-y-auto">
               <table className="w-full text-xs">
-                <thead className="sticky top-0 bg-[var(--surface-1)]">
+                <thead className="sticky top-0 bg-slate-800">
                   <tr className="text-slate-500">
                     <th className="text-left font-normal px-1">URDF Joint</th>
                     <th className="text-left font-normal px-1">→</th>
                     <th className="text-left font-normal px-1">
                       Dataset Column
                     </th>
-                    <th className="text-right font-normal px-1">Value</th>
+                    <th className="text-right font-normal px-1">
+                      Value [Limits]
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
-                  {displayJointNames.map((jointName) => (
-                    <tr key={jointName} className="border-t border-white/10/50">
-                      <td className="px-1 py-0.5 text-slate-300 font-mono">
-                        {jointName}
-                      </td>
-                      <td className="px-1 text-slate-600">→</td>
-                      <td className="px-1 py-0.5">
-                        <select
-                          value={mapping[jointName] ?? ""}
-                          onChange={(e) =>
-                            setMapping((m) => ({
-                              ...m,
-                              [jointName]: e.target.value,
-                            }))
-                          }
-                          className="bg-[var(--surface-0)] text-slate-200 text-xs rounded px-1 py-0.5 border border-white/10 w-full max-w-[200px]"
-                        >
-                          <option value="">-- unmapped --</option>
-                          {selectedColumns.map((col) => {
-                            const label = col.split(SERIES_DELIM).pop() ?? col;
-                            return (
-                              <option key={col} value={col}>
-                                {label}
-                              </option>
-                            );
-                          })}
-                        </select>
-                      </td>
-                      <td className="px-1 py-0.5 text-right tabular-nums text-slate-400 font-mono">
-                        {jointValues[jointName] !== undefined
-                          ? jointValues[jointName].toFixed(3)
-                          : "—"}
-                      </td>
-                    </tr>
-                  ))}
+                  {displayJointNames.map((jointName) => {
+                    const hasViolation = violatedJointsSet.has(jointName);
+                    const limit = jointLimits[jointName];
+                    const value = jointValues[jointName];
+
+                    return (
+                      <tr
+                        key={jointName}
+                        className={`border-t border-slate-700/50 ${
+                          hasViolation ? "bg-amber-900/20" : ""
+                        }`}
+                      >
+                        <td className="px-1 py-0.5 text-slate-300 font-mono">
+                          <div className="flex items-center gap-1">
+                            {hasViolation && (
+                              <span
+                                className="text-amber-400 text-xs"
+                                title="Value exceeds URDF limits — highlighted in 3D view"
+                              >
+                                ⚠
+                              </span>
+                            )}
+                            {jointName}
+                          </div>
+                        </td>
+                        <td className="px-1 text-slate-600">→</td>
+                        <td className="px-1 py-0.5">
+                          <select
+                            value={mapping[jointName] ?? ""}
+                            onChange={(e) =>
+                              setMapping((m) => ({
+                                ...m,
+                                [jointName]: e.target.value,
+                              }))
+                            }
+                            className="bg-slate-900 text-slate-200 text-xs rounded px-1 py-0.5 border border-slate-600 w-full max-w-[200px]"
+                          >
+                            <option value="">-- unmapped --</option>
+                            {selectedColumns.map((col) => {
+                              const label =
+                                col.split(SERIES_DELIM).pop() ?? col;
+                              return (
+                                <option key={col} value={col}>
+                                  {label}
+                                </option>
+                              );
+                            })}
+                          </select>
+                        </td>
+                        <td className="px-1 py-0.5 text-right tabular-nums font-mono">
+                          <div className="flex items-center justify-end gap-1">
+                            <span
+                              className={
+                                hasViolation
+                                  ? "text-amber-300 font-semibold"
+                                  : "text-slate-400"
+                              }
+                            >
+                              {value !== undefined ? value.toFixed(3) : "—"}
+                            </span>
+                            {limit && value !== undefined && (
+                              <span
+                                className="text-slate-600 text-xs"
+                                title={`Limits: [${limit.lower.toFixed(3)}, ${limit.upper.toFixed(3)}]`}
+                              >
+                                [{limit.lower.toFixed(2)},{" "}
+                                {limit.upper.toFixed(2)}]
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
