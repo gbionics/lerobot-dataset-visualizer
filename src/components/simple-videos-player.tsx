@@ -23,7 +23,7 @@ export const SimpleVideosPlayer = ({
   videosInfo,
   onVideosReady,
 }: VideoPlayerProps) => {
-  const { currentTime, setCurrentTime, isPlaying, setIsPlaying } = useTime();
+  const { currentTime, seek, isPlaying, setIsPlaying } = useTime();
   const videoRefs = useRef<(HTMLVideoElement | null)[]>([]);
   const [hiddenVideos, setHiddenVideos] = React.useState<string[]>([]);
   const [enlargedVideo, setEnlargedVideo] = React.useState<string | null>(null);
@@ -81,7 +81,7 @@ export const SimpleVideosPlayer = ({
             ) {
               video.currentTime = segmentStart;
               if (index === firstVisibleIdx) {
-                setCurrentTime(0);
+                seek(0, "video");
               }
             }
           };
@@ -102,7 +102,7 @@ export const SimpleVideosPlayer = ({
           const handleEnded = () => {
             video.currentTime = 0;
             if (index === firstVisibleIdx) {
-              setCurrentTime(0);
+              seek(0, "video");
             }
           };
 
@@ -127,13 +127,7 @@ export const SimpleVideosPlayer = ({
         }
       });
     };
-  }, [
-    videosInfo,
-    onVideosReady,
-    setIsPlaying,
-    firstVisibleIdx,
-    setCurrentTime,
-  ]);
+  }, [videosInfo, onVideosReady, setIsPlaying, firstVisibleIdx, seek]);
 
   // Handle play/pause — skip hidden videos
   useEffect(() => {
@@ -195,10 +189,10 @@ export const SimpleVideosPlayer = ({
           globalTime = video.currentTime - (info.segmentStart || 0);
         }
         lastVideoTimeRef.current = globalTime;
-        setCurrentTime(globalTime);
+        seek(globalTime, "video");
       };
     },
-    [videosInfo, setCurrentTime],
+    [videosInfo, seek],
   );
 
   // Handle play click for segmented videos

@@ -559,7 +559,7 @@ function EpisodeViewerInner({
   };
 
   // Use context for time sync
-  const { currentTime, setCurrentTime, setIsPlaying, isPlaying } = useTime();
+  const { currentTime, seek, setIsPlaying, isPlaying } = useTime();
 
   // URDFViewer episode changer and play toggle — populated by URDFViewer on mount
   const urdfChangerRef = useRef<((ep: number) => void) | undefined>(undefined);
@@ -607,10 +607,10 @@ function EpisodeViewerInner({
     if (timeParam) {
       const timeValue = parseFloat(timeParam);
       if (!isNaN(timeValue)) {
-        setCurrentTime(timeValue);
+        seek(timeValue, "external");
       }
     }
-  }, [searchParams, setCurrentTime]);
+  }, [searchParams, seek]);
 
   // sync with parent window hf.co/spaces
   useEffect(() => {
