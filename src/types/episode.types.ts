@@ -5,6 +5,7 @@
 import type { DatasetInfo } from "./dataset.types";
 import type { VideoInfo } from "./video.types";
 import type { ChartDataGroup } from "./chart.types";
+import type { LanguageAtom } from "./language.types";
 
 // Episode metadata for v3.0
 export interface EpisodeMetadataV3 {
@@ -50,6 +51,8 @@ export interface EpisodeData {
   ignoredColumns: string[];
   duration: number;
   task?: string;
+  languageAtoms?: LanguageAtom[];
+  frameTimestamps?: number[];
 }
 
 // Raw parquet row structure

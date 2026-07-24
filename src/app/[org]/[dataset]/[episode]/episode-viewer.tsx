@@ -11,10 +11,15 @@ import {
 import { useRouter, useSearchParams } from "next/navigation";
 import { postParentMessageWithParams } from "@/utils/postParentMessage";
 import { SimpleVideosPlayer } from "@/components/simple-videos-player";
-import DataRecharts from "@/components/data-recharts";
 import PlaybackBar from "@/components/playback-bar";
 import { TimeProvider, useTime } from "@/context/time-context";
 import { FlaggedEpisodesProvider } from "@/context/flagged-episodes-context";
+import {
+  AnnotationsProvider,
+  useAnnotations,
+} from "@/context/annotations-context";
+import { AnnotationsPanel } from "@/components/annotations-panel";
+import { AnnotationsTimeline } from "@/components/annotations-timeline";
 import Sidebar from "@/components/side-nav";
 import StatsPanel from "@/components/stats-panel";
 import OverviewPanel from "@/components/overview-panel";
@@ -42,6 +47,7 @@ const ActionInsightsPanel = lazy(
 );
 const FilteringPanel = lazy(() => import("@/components/filtering-panel"));
 const AnomaliesPanel = lazy(() => import("@/components/anomalies-panel"));
+const DataRecharts = lazy(() => import("@/components/data-recharts"));
 
 import type {
   DatasetAnomaliesData,
@@ -57,6 +63,7 @@ type ActiveTab =
   | "insights"
   | "filtering"
   | "anomalies"
+  | "annotations"
   | "urdf";
 
 export default function EpisodeViewer({
@@ -121,7 +128,9 @@ export default function EpisodeViewer({
   return (
     <TimeProvider duration={data!.duration}>
       <FlaggedEpisodesProvider>
-        <EpisodeViewerInner data={data!} org={org} dataset={dataset} />
+        <AnnotationsProvider>
+          <EpisodeViewerInner data={data!} org={org} dataset={dataset} />
+        </AnnotationsProvider>
       </FlaggedEpisodesProvider>
     </TimeProvider>
   );
@@ -145,6 +154,8 @@ function EpisodeViewerInner({
     task,
   } = data;
 
+  const { setEpisode } = useAnnotations();
+
   const [videosReady, setVideosReady] = useState(!videosInfo.length);
   const [chartsReady, setChartsReady] = useState(false);
 
@@ -164,6 +175,23 @@ function EpisodeViewerInner({
       );
     }
   }, [isLoading, videosReady, chartsReady]);
+
+  // Set episode data for annotations context
+  useEffect(() => {
+    setEpisode(
+      episodeId,
+      { repoId: datasetInfo.repoId },
+      data.languageAtoms,
+      data.frameTimestamps,
+    );
+  }, [
+    episodeId,
+    datasetInfo.repoId,
+    data.languageAtoms,
+    data.frameTimestamps,
+    setEpisode,
+  ]);
+
   const [, setColumnMinMax] = useState<ColumnMinMax[] | null>(null);
   const [episodeLengthStats, setEpisodeLengthStats] =
     useState<EpisodeLengthStats | null>(null);
@@ -776,6 +804,19 @@ function EpisodeViewerInner({
             <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-orange-500" />
           )}
         </button>
+        <button
+          className={`px-6 py-2.5 text-sm font-medium transition-colors relative ${
+            activeTab === "annotations"
+              ? "text-orange-400"
+              : "text-slate-400 hover:text-slate-200"
+          }`}
+          onClick={() => handleTabChange("annotations")}
+        >
+          Annotations
+          {activeTab === "annotations" && (
+            <span className="absolute bottom-0 left-0 right-0 h-0.5 bg-orange-500" />
+          )}
+        </button>
         {hasURDFSupport(datasetInfo.robot_type) &&
           datasetInfo.codebase_version >= "v3.0" && (
             <>
@@ -811,9 +852,10 @@ function EpisodeViewerInner({
 
       {/* Body: sidebar + content */}
       <div className="flex flex-1 min-h-0">
-        {/* Sidebar — on Episodes, 3D Replay, and Anomalies tabs */}
+        {/* Sidebar — on Episodes, 3D Replay, Annotations, and Anomalies tabs */}
         {(activeTab === "episodes" ||
           activeTab === "urdf" ||
+          activeTab === "annotations" ||
           activeTab === "anomalies") && (
           <Sidebar
             datasetInfo={datasetInfo}
@@ -992,6 +1034,22 @@ function EpisodeViewerInner({
                 computingProgress={computingAllProgress}
               />
             </Suspense>
+          )}
+
+          {activeTab === "annotations" && (
+            <div className="annotations-skin flex flex-col gap-4">
+              {videosInfo.length > 0 && (
+                <SimpleVideosPlayer
+                  videosInfo={videosInfo}
+                  onVideosReady={() => setVideosReady(true)}
+                />
+              )}
+              <PlaybackBar />
+              <AnnotationsTimeline duration={data.duration} />
+              <AnnotationsPanel
+                cameraKeys={videosInfo.map((v) => v.filename)}
+              />
+            </div>
           )}
         </div>
       </div>
