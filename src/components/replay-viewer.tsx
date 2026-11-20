@@ -27,6 +27,13 @@ import {
 } from "@/components/replay-trail";
 import { tipSide } from "@/lib/trail";
 import RobotLoader, { type LoaderRobot } from "@/components/robot-loader";
+import CustomRobotScene from "@/components/custom-robot-scene";
+import { isLocalMode } from "@/utils/localDatasetShared";
+import {
+  manifestJointMapping,
+  robotManifestMatches,
+} from "@/utils/robotManifest";
+import { useRobotManifest } from "@/utils/useRobotManifest";
 import { CHART_CONFIG } from "@/utils/constants";
 import { getDatasetVersionAndInfo } from "@/utils/versionUtils";
 import type { DatasetMetadata } from "@/utils/parquetUtils";
@@ -68,6 +75,8 @@ export function prefetchRobotModel(
   robotType: string | null,
   columns: string[],
 ) {
+  /// In local mode nothing is fetched until the model to show is known.
+  if (isLocalMode()) return;
   /// A failed download leaves the cache, so the viewer tries again and reports it.
   loadUsdBlob(getRobotConfig(robotType, columns).usdUrl).catch(() => {});
 }
@@ -965,7 +974,14 @@ export default function ReplayViewer({
       ),
     [datasetInfo.robot_type, data.flatChartData],
   );
-  const { robot, usdUrl, scale, restHeight } = robotConfig;
+  const manifest = useRobotManifest();
+  const customRobot =
+    manifest && robotManifestMatches(manifest, datasetInfo.robot_type)
+      ? manifest
+      : null;
+  const { robot, usdUrl } = robotConfig;
+  const scale = customRobot?.scale ?? robotConfig.scale;
+  const restHeight = customRobot?.restHeight ?? robotConfig.restHeight;
   const isG1 = robot === "g1";
   const isOpenArm = robot === "openarm";
   const repoId = org && dataset ? `${org}/${dataset}` : null;
@@ -1070,8 +1086,13 @@ export default function ReplayViewer({
 
   // Joint mapping
   const autoMapping = useMemo(
-    () => autoMatchJoints(jointNames, selectedColumns),
-    [jointNames, selectedColumns],
+    () => ({
+      ...autoMatchJoints(jointNames, selectedColumns),
+      ...(customRobot
+        ? manifestJointMapping(customRobot, selectedColumns, SERIES_DELIM)
+        : {}),
+    }),
+    [jointNames, selectedColumns, customRobot],
   );
   const [mapping, setMapping] = useState<Record<string, string>>(autoMapping);
   useEffect(() => setMapping(autoMapping), [autoMapping]);
@@ -1330,21 +1351,35 @@ export default function ReplayViewer({
             <planeGeometry args={[10, 10]} />
             <shadowMaterial opacity={0.35} />
           </mesh>
-          <RobotScene
-            robot={robot}
-            usdUrl={usdUrl}
-            jointValues={jointValues}
-            basePose={basePose}
-            onJointsLoaded={onJointsLoaded}
-            onTrailSides={setTrailSides}
-            poseAt={poseAt}
-            totalFrames={totalFrames}
-            frame={frame}
-            fps={fps}
-            trailMode={trailMode}
-            dark={dark}
-            scale={scale}
-          />
+          {customRobot ? (
+            <CustomRobotScene
+              manifest={customRobot}
+              jointValues={jointValues}
+              basePose={basePose}
+              scale={scale}
+              onJointsLoaded={onJointsLoaded}
+              fitCamera={fitCameraToRobot}
+            />
+          ) : (
+            /// In local mode the Hub's model loads only once it is known there is no custom robot.
+            (manifest !== undefined || !isLocalMode()) && (
+              <RobotScene
+                robot={robot}
+                usdUrl={usdUrl}
+                jointValues={jointValues}
+                basePose={basePose}
+                onJointsLoaded={onJointsLoaded}
+                onTrailSides={setTrailSides}
+                poseAt={poseAt}
+                totalFrames={totalFrames}
+                frame={frame}
+                fps={fps}
+                trailMode={trailMode}
+                dark={dark}
+                scale={scale}
+              />
+            )
+          )}
           <Grid
             args={[10, 10]}
             cellSize={isG1 ? 0.5 : 0.2}

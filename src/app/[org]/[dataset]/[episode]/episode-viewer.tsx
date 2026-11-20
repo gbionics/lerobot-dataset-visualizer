@@ -26,6 +26,8 @@ import Loading from "@/components/loading-component";
 import HfAuthButton from "@/components/hf-auth-button";
 import { EpisodeHeader, ThemeToggle } from "@/components/ui";
 import { hasRobotModel } from "@/lib/so101-robot";
+import { robotManifestMatches } from "@/utils/robotManifest";
+import { useRobotManifest } from "@/utils/useRobotManifest";
 import {
   crossEpisodeCache,
   datasetCacheKey,
@@ -564,8 +566,11 @@ function EpisodeViewerInner({
 
   const router = useRouter();
 
+  const robotManifest = useRobotManifest();
   const replaySupported =
-    hasRobotModel(datasetInfo.robot_type) &&
+    (hasRobotModel(datasetInfo.robot_type) ||
+      (!!robotManifest &&
+        robotManifestMatches(robotManifest, datasetInfo.robot_type))) &&
     datasetInfo.codebase_version >= "v3.0";
 
   // Tab state & lazy stats — read sessionStorage in the initializer so the

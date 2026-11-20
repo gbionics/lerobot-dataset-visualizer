@@ -140,6 +140,39 @@ LOCAL_DATASET_PATH=/path/to/your/datasets bun dev
 
 This sets `NEXT_PUBLIC_LOCAL_MODE` at build time so the app serves data from the local filesystem instead of HuggingFace.
 
+The local routes are unauthenticated; bind to loopback with `bun dev -H 127.0.0.1` if the machine is on a shared network.
+
+#### Custom robot model (3D Replay)
+
+In local mode the 3D Replay tab can show your own robot from a URDF, with files kept outside the repository. Put them in `.robot/` (gitignored and dockerignored) or set `ROBOT_MODEL_DIR`:
+
+```
+.robot/
+  robot.json
+  model.urdf
+  meshes/...   # stl, dae or obj
+```
+
+`robot.json` (only `urdf` is required):
+
+```json
+{
+  "urdf": "model.urdf",
+  "match": ["my_robot"],
+  "scale": 1,
+  "restHeight": 0,
+  "joints": { "urdf_joint_name": "dataset_column_name" },
+  "packages": { "my_pkg": "meshes" },
+  "meshColor": "#8a8f98"
+}
+```
+
+- `match`: used when the dataset's `robot_type` contains one of these strings (case-insensitive); omit to match every dataset.
+- `joints`: URDF joint → dataset column (the part after the feature prefix). Unmapped joints can be set in the viewer's Joint Mapping panel.
+- `packages`: resolves `package://<name>/...` URIs to a directory inside the model directory (default `<name>`).
+
+Only `json`, `urdf`, `xml`, `stl`, `dae`, `obj`, `mtl`, `png` and `jpg` files are served, and only from inside this directory.
+
 ## Annotations backend (optional)
 
 The Annotations tab edits LeRobot v3.1 language atoms — `language_persistent`
