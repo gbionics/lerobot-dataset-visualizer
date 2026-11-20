@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { readFile } from "fs/promises";
+import { createReadStream } from "fs";
+import { stat } from "fs/promises";
+import { Readable } from "stream";
 import { join, resolve, sep } from "path";
 
 const LOCAL_DATASET_PATH = process.env.LOCAL_DATASET_PATH;
@@ -38,9 +40,11 @@ export async function GET(
     return NextResponse.json({ error: "Forbidden" }, { status: 403 });
   }
 
-  let buffer: Buffer;
+  let size: number;
   try {
-    buffer = await readFile(target);
+    const info = await stat(target);
+    if (!info.isFile()) throw new Error("not a file");
+    size = info.size;
   } catch {
     return NextResponse.json({ error: "Not found" }, { status: 404 });
   }
@@ -48,35 +52,48 @@ export async function GET(
   const ext = target.split(".").pop()?.toLowerCase() ?? "";
   const contentType = EXT_CONTENT_TYPE[ext] ?? "application/octet-stream";
 
-  // Support HTTP range requests so browsers can seek in video files
+  const stream = (start: number, end: number) =>
+    Readable.toWeb(
+      createReadStream(target, { start, end }),
+    ) as unknown as ReadableStream<Uint8Array>;
+
+  // Range requests are needed for video seeking and for parquet range reads
   const rangeHeader = request.headers.get("range");
-  if (contentType === "video/mp4" && rangeHeader) {
-    const total = buffer.length;
-    const match = /bytes=(\d+)-(\d*)/.exec(rangeHeader);
-    if (match) {
-      const start = parseInt(match[1], 10);
-      const end = match[2] ? parseInt(match[2], 10) : total - 1;
-      const safeEnd = Math.min(end, total - 1);
-      const chunk = new Uint8Array(buffer).subarray(start, safeEnd + 1);
-      return new NextResponse(chunk.buffer as ArrayBuffer, {
-        status: 206,
-        headers: {
-          "Content-Type": "video/mp4",
-          "Content-Range": `bytes ${start}-${safeEnd}/${total}`,
-          "Accept-Ranges": "bytes",
-          "Content-Length": String(chunk.length),
-        },
+  const match = rangeHeader ? /^bytes=(\d*)-(\d*)$/.exec(rangeHeader) : null;
+  if (match && (match[1] || match[2]) && size > 0) {
+    let start: number;
+    let end: number;
+    if (match[1]) {
+      start = parseInt(match[1], 10);
+      end = match[2] ? Math.min(parseInt(match[2], 10), size - 1) : size - 1;
+    } else {
+      // Suffix range: the last N bytes
+      start = Math.max(size - parseInt(match[2], 10), 0);
+      end = size - 1;
+    }
+    if (start > end || start >= size) {
+      return new NextResponse(null, {
+        status: 416,
+        headers: { "Content-Range": `bytes */${size}` },
       });
     }
+    return new NextResponse(stream(start, end), {
+      status: 206,
+      headers: {
+        "Content-Type": contentType,
+        "Content-Range": `bytes ${start}-${end}/${size}`,
+        "Accept-Ranges": "bytes",
+        "Content-Length": String(end - start + 1),
+      },
+    });
   }
 
-  const bytes = new Uint8Array(buffer);
-  return new NextResponse(bytes.buffer as ArrayBuffer, {
+  return new NextResponse(size > 0 ? stream(0, size - 1) : null, {
     status: 200,
     headers: {
       "Content-Type": contentType,
       "Accept-Ranges": "bytes",
-      "Content-Length": String(buffer.length),
+      "Content-Length": String(size),
     },
   });
 }

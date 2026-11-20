@@ -42,3 +42,15 @@ export function buildLocalUrl(repoId: string, path: string): string {
   const dataset = datasetNameFromRepoId(repoId);
   return localApiUrl(dataset, path);
 }
+
+/**
+ * Endpoint for the Hub client so that the `/datasets/<repo>/resolve/<rev>/<path>` URLs it builds
+ * hit the local-dataset route (see the rewrite in next.config.ts).
+ */
+export function localHubEndpoint(): string {
+  const origin =
+    typeof window !== "undefined"
+      ? window.location.origin
+      : `http://localhost:${process.env.PORT || "3000"}`;
+  return `${origin}/api/local-hub`;
+}

@@ -20,6 +20,7 @@ import {
   buildVersionedUrl,
   getDatasetStats,
 } from "@/utils/versionUtils";
+import { isLocalMode, localHubEndpoint } from "@/utils/localDatasetShared";
 import { AsyncCache } from "@/utils/asyncCache";
 import {
   dimensionStats,
@@ -153,7 +154,7 @@ function leRobotDataset(repoId: string): LeRobotDataset {
   let dataset = leRobotDatasets.get(key);
   if (!dataset) {
     dataset = new LeRobotDataset(repoId, {
-      endpoint: HUB_ENDPOINT,
+      endpoint: isLocalMode() ? localHubEndpoint() : HUB_ENDPOINT,
       additionalFetchHeaders: authHeaders(),
       fetch: rangeCachedFetch,
     });

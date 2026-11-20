@@ -16,6 +16,16 @@ const nextConfig: NextConfig = {
     optimizePackageImports: ["react-icons", "recharts", "@huggingface/hub"],
   },
   generateBuildId: () => packageJson.version,
+  async rewrites() {
+    if (!process.env.LOCAL_DATASET_PATH) return [];
+    // The Hub client's URLs for "local/<dataset>" become reads of the local dataset directory.
+    return [
+      {
+        source: "/api/local-hub/datasets/:org/:repo*/resolve/:rev/:file*",
+        destination: "/api/local-dataset/:repo*/:file*",
+      },
+    ];
+  },
   env: {
     NEXT_PUBLIC_LOCAL_MODE: process.env.LOCAL_DATASET_PATH ? "1" : "",
   },
