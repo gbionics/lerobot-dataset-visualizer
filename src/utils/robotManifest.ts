@@ -1,6 +1,6 @@
 /**
- * A custom robot model served from a local directory (ROBOT_MODEL_DIR, `.robot` by default).
- * Nothing about the robot is in the repository: `robot.json` in that directory describes it.
+ * A custom robot model. Nothing about the robot is in the repository: the manifest (ROBOT_MANIFEST,
+ * `.robot/robot.json` by default) describes it and the model files live in ROBOT_MODEL_DIR (`.robot` by default).
  */
 export type RobotManifest = {
   /** URDF path, relative to the model directory. */
@@ -18,8 +18,6 @@ export type RobotManifest = {
   /** Colour for meshes that carry none of their own. */
   meshColor?: string;
 };
-
-const MANIFEST_FILE = "robot.json";
 
 function isStringRecord(value: unknown): value is Record<string, string> {
   return (
@@ -75,4 +73,4 @@ export function manifestJointMapping(
 }
 
 export const ROBOT_FILES_URL = "/api/local-robot";
-export const ROBOT_MANIFEST_URL = `${ROBOT_FILES_URL}/${MANIFEST_FILE}`;
+export const ROBOT_MANIFEST_URL = "/api/local-robot-manifest";

@@ -144,16 +144,16 @@ The local routes are unauthenticated; bind to loopback with `bun dev -H 127.0.0.
 
 #### Custom robot model (3D Replay)
 
-In local mode the 3D Replay tab can show your own robot from a URDF, with files kept outside the repository. Put them in `.robot/` (gitignored and dockerignored) or set `ROBOT_MODEL_DIR`:
+In local mode the 3D Replay tab can show your own robot from a URDF, with files kept outside the repository. The manifest is read from `.robot/robot.json` (or `ROBOT_MANIFEST`), and the URDF and meshes from `ROBOT_MODEL_DIR` (default `.robot/`), which can be any folder outside the repository. `.robot/` is gitignored and dockerignored.
 
 ```
-.robot/
-  robot.json
+.robot/robot.json
+$ROBOT_MODEL_DIR/
   model.urdf
   meshes/...   # stl, dae or obj
 ```
 
-`robot.json` (only `urdf` is required):
+`robot.json` (only `urdf` is required; it is resolved inside `ROBOT_MODEL_DIR`):
 
 ```json
 {
@@ -171,7 +171,7 @@ In local mode the 3D Replay tab can show your own robot from a URDF, with files 
 - `joints`: URDF joint → dataset column (the part after the feature prefix). Unmapped joints can be set in the viewer's Joint Mapping panel.
 - `packages`: resolves `package://<name>/...` URIs to a directory inside the model directory (default `<name>`).
 
-Only `json`, `urdf`, `xml`, `stl`, `dae`, `obj`, `mtl`, `png` and `jpg` files are served, and only from inside this directory.
+Only `urdf`, `xml`, `stl`, `dae`, `obj`, `mtl`, `png` and `jpg` files are served from `ROBOT_MODEL_DIR`, and nothing outside it.
 
 ## Annotations backend (optional)
 

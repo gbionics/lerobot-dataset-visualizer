@@ -5,7 +5,7 @@ import { resolve } from "path";
 import { Readable } from "stream";
 import { resolveInside } from "@/utils/safePath";
 
-// Serves the custom robot model (URDF, meshes, robot.json) from ROBOT_MODEL_DIR. Only in local mode,
+// Serves the custom robot model (URDF and meshes) from ROBOT_MODEL_DIR. Only in local mode,
 // and only model file types: the directory can hold anything else.
 const LOCAL_DATASET_PATH = process.env.LOCAL_DATASET_PATH;
 const ROBOT_MODEL_DIR = resolve(
@@ -14,7 +14,6 @@ const ROBOT_MODEL_DIR = resolve(
 );
 
 const EXT_CONTENT_TYPE: Record<string, string> = {
-  json: "application/json",
   urdf: "application/xml",
   xml: "application/xml",
   stl: "model/stl",
