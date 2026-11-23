@@ -8,7 +8,10 @@ import type { URDFRobot } from "urdf-loader";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { ColladaLoader } from "three/examples/jsm/loaders/ColladaLoader.js";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
-import { ROBOT_FILES_URL, type RobotManifest } from "@/utils/robotManifest";
+import {
+  robotFileUrl as fileUrl,
+  type RobotManifest,
+} from "@/utils/robotManifest";
 
 const Z_UP_TO_Y_UP = new THREE.Quaternion().setFromAxisAngle(
   new THREE.Vector3(1, 0, 0),
@@ -16,8 +19,14 @@ const Z_UP_TO_Y_UP = new THREE.Quaternion().setFromAxisAngle(
 );
 const poseQuaternion = new THREE.Quaternion();
 
-function fileUrl(path: string): string {
-  return `${ROBOT_FILES_URL}/${path.split("/").map(encodeURIComponent).join("/")}`;
+/** The meshes a joint moves on its own: its descendants up to the next joint that moves. */
+function linkMeshes(object: THREE.Object3D, out: Set<THREE.Mesh>) {
+  for (const child of object.children) {
+    const joint = child as { isURDFJoint?: boolean; jointType?: string };
+    if (joint.isURDFJoint && joint.jointType !== "fixed") continue;
+    if (child instanceof THREE.Mesh) out.add(child);
+    linkMeshes(child, out);
+  }
 }
 
 /**
@@ -31,6 +40,8 @@ export default function CustomRobotScene({
   scale,
   onJointsLoaded,
   fitCamera,
+  highlightJoints,
+  highlightColor = "#d03b3b",
 }: {
   manifest: RobotManifest;
   jointValues: Record<string, number>;
@@ -42,14 +53,29 @@ export default function CustomRobotScene({
     camera: THREE.Camera,
     controls: unknown,
   ) => void;
+  /** Joints whose link is drawn in `highlightColor`. */
+  highlightJoints?: ReadonlySet<string>;
+  highlightColor?: string;
 }) {
   const { scene, camera, controls, invalidate } = useThree();
   const robotRef = useRef<URDFRobot | null>(null);
   const [version, setVersion] = useState(0);
   const pendingFitRef = useRef(false);
+  /// Meshes drawn in the highlight, with the material each had.
+  const tintedRef = useRef(new Map<THREE.Mesh, THREE.Material>());
+  const [tint] = useState(
+    () =>
+      new THREE.MeshStandardMaterial({
+        metalness: 0.25,
+        roughness: 0.5,
+        emissiveIntensity: 0.35,
+      }),
+  );
+  useEffect(() => () => tint.dispose(), [tint]);
 
   useEffect(() => {
     let disposed = false;
+    const tinted = tintedRef.current;
     const manager = new THREE.LoadingManager();
     // The meshes arrive after the URDF: frame the camera once they are all in.
     manager.onLoad = () => {
@@ -115,6 +141,9 @@ export default function CustomRobotScene({
       (robot) => {
         if (disposed) return;
         robotRef.current = robot;
+        // The model shows what was recorded, even past a joint's limit.
+        for (const joint of Object.values(robot.joints))
+          joint.ignoreLimits = true;
         const names = Object.entries(robot.joints)
           .filter(
             ([, joint]) =>
@@ -136,6 +165,8 @@ export default function CustomRobotScene({
     return () => {
       disposed = true;
       const robot = robotRef.current;
+      for (const [mesh, material] of tinted) mesh.material = material;
+      tinted.clear();
       if (robot) {
         scene.remove(robot);
         robot.traverse((child) => {
@@ -197,6 +228,30 @@ export default function CustomRobotScene({
     fitCamera,
     invalidate,
   ]);
+
+  useEffect(() => {
+    tint.color.set(highlightColor);
+    tint.emissive.set(highlightColor);
+    const robot = robotRef.current;
+    if (!robot) return;
+    const wanted = new Set<THREE.Mesh>();
+    for (const name of highlightJoints ?? []) {
+      const joint = robot.joints[name];
+      if (joint) linkMeshes(joint, wanted);
+    }
+    const tinted = tintedRef.current;
+    for (const [mesh, material] of tinted) {
+      if (wanted.has(mesh)) continue;
+      mesh.material = material;
+      tinted.delete(mesh);
+    }
+    for (const mesh of wanted) {
+      if (tinted.has(mesh)) continue;
+      tinted.set(mesh, mesh.material as THREE.Material);
+      mesh.material = tint;
+    }
+    invalidate();
+  }, [highlightJoints, highlightColor, tint, version, invalidate]);
 
   return null;
 }

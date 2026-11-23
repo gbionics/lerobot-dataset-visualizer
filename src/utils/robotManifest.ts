@@ -78,3 +78,8 @@ export function manifestJointMapping(
 
 export const ROBOT_FILES_URL = "/api/local-robot";
 export const ROBOT_MANIFEST_URL = "/api/local-robot-manifest";
+
+/** URL of a file in the model directory. */
+export function robotFileUrl(path: string): string {
+  return `${ROBOT_FILES_URL}/${path.split("/").map(encodeURIComponent).join("/")}`;
+}

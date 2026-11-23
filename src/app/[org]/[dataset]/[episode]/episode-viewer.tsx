@@ -28,6 +28,7 @@ import { EpisodeHeader, ThemeToggle } from "@/components/ui";
 import { hasRobotModel } from "@/lib/so101-robot";
 import { robotManifestMatches } from "@/utils/robotManifest";
 import { useRobotManifest } from "@/utils/useRobotManifest";
+import { loadUrdfJoints } from "@/utils/useUrdfJoints";
 import {
   crossEpisodeCache,
   datasetCacheKey,
@@ -35,6 +36,8 @@ import {
   episodeFramesCache,
   episodeLengthsCache,
   getEpisodeDataSafe,
+  jointLimitsCache,
+  loadDatasetLimitViolations,
   loadAllEpisodeLengths,
   loadAllEpisodeFrameInfo,
   loadCrossEpisodeActionVariance,
@@ -54,6 +57,7 @@ const ActionInsightsPanel = lazy(
   () => import("@/components/action-insights-panel"),
 );
 const FilteringPanel = lazy(() => import("@/components/filtering-panel"));
+const JointLimitsPanel = lazy(() => import("@/components/joint-limits-panel"));
 // Recharts is ~150KB gz and not above-the-fold (videos render first on the
 // Episodes tab). Lazy-load it so the initial chunk can ship faster and
 // videos start downloading in parallel with the chart bundle.
@@ -101,6 +105,7 @@ const TABS = [
   "insights",
   "filtering",
   "doctor",
+  "limits",
   "replay",
   "hands",
 ] as const;
@@ -180,6 +185,11 @@ const ADVANCED_TABS: { tab: ActiveTab; label: string; hint: string }[] = [
     hint: "Chunk length, control delay, variance",
   },
   {
+    tab: "limits",
+    label: "Joint Limits",
+    hint: "Frames past the robot model's joint limits",
+  },
+  {
     tab: "doctor",
     label: "Doctor",
     hint: "Quality checks by lerobot-doctor",
@@ -190,17 +200,23 @@ function AdvancedTabsMenu({
   activeTab,
   onSelect,
   handsAvailable,
+  limitsAvailable,
 }: {
   activeTab: ActiveTab;
   onSelect: (tab: ActiveTab) => void;
   handsAvailable: boolean;
+  limitsAvailable: boolean;
 }) {
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const { count: flaggedCount } = useFlaggedEpisodes();
-  const tabs = ADVANCED_TABS.filter((t) => t.tab !== "hands" || handsAvailable);
+  const tabs = ADVANCED_TABS.filter(
+    (t) =>
+      (t.tab !== "hands" || handsAvailable) &&
+      (t.tab !== "limits" || limitsAvailable),
+  );
   const active = tabs.find((t) => t.tab === activeTab);
 
   useEffect(() => {
@@ -567,6 +583,13 @@ function EpisodeViewerInner({
   const router = useRouter();
 
   const robotManifest = useRobotManifest();
+  const customRobot =
+    robotManifest && robotManifestMatches(robotManifest, datasetInfo.robot_type)
+      ? robotManifest
+      : null;
+  /// The custom robot's URDF gives the limits; v3.0, like 3D Replay.
+  const limitsSupported =
+    !!customRobot && datasetInfo.codebase_version >= "v3.0";
   const replaySupported =
     (hasRobotModel(datasetInfo.robot_type) ||
       (!!robotManifest &&
@@ -584,7 +607,8 @@ function EpisodeViewerInner({
       if (
         TABS.includes(requested as ActiveTab) &&
         (requested !== "hands" || data.handTracking) &&
-        (requested !== "replay" || replaySupported)
+        (requested !== "replay" || replaySupported) &&
+        (requested !== "limits" || limitsSupported)
       )
         return requested as ActiveTab;
       const stored = tabId(sessionStorage.getItem("activeTab"));
@@ -592,6 +616,7 @@ function EpisodeViewerInner({
       if (
         TABS.includes(stored as ActiveTab) &&
         (stored !== "replay" || replaySupported) &&
+        (stored !== "limits" || limitsSupported) &&
         (stored !== "hands" || data.handTracking)
       ) {
         return stored as ActiveTab;
@@ -662,6 +687,23 @@ function EpisodeViewerInner({
     cacheKey,
     activeTab === "statistics",
     () => loadDatasetSchema(repoId),
+  );
+  const limitScan = useCachedResource(
+    jointLimitsCache,
+    `${cacheKey}|${customRobot?.urdf ?? ""}`,
+    activeTab === "limits" && limitsSupported,
+    async (onProgress) => {
+      if (!customRobot) throw new Error("No robot model");
+      const joints = await loadUrdfJoints(customRobot);
+      if (!joints) throw new Error("The robot model couldn't be read");
+      return loadDatasetLimitViolations(
+        repoId,
+        episodes,
+        joints,
+        customRobot,
+        onProgress,
+      );
+    },
   );
   const episodeLengthStats = lengths.data;
   const crossEpData = crossEpisode.data;
@@ -875,6 +917,7 @@ function EpisodeViewerInner({
           activeTab={activeTab}
           onSelect={handleTabChange}
           handsAvailable={!!data.handTracking}
+          limitsAvailable={limitsSupported}
         />
         <div className="ml-auto flex shrink-0 items-center gap-1 pl-2">
           <ThemeToggle />
@@ -1048,6 +1091,17 @@ function EpisodeViewerInner({
                   setSidebarFlaggedOnly(true);
                   handleTabChange("episodes");
                 }}
+              />
+            </Suspense>
+          )}
+
+          {activeTab === "limits" && limitsSupported && (
+            <Suspense fallback={<Loading />}>
+              <JointLimitsPanel
+                scan={limitScan.data}
+                loading={limitScan.loading}
+                failed={limitScan.failed}
+                progress={limitScan.progress}
               />
             </Suspense>
           )}

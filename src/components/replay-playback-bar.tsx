@@ -15,6 +15,9 @@ interface ReplayPlaybackBarProps {
   onTrailModeChange: (mode: TrailMode) => void;
   onFrameChange: (e: React.ChangeEvent<HTMLInputElement>) => void;
   disabled?: boolean;
+  /** Frame ranges (inclusive) marked under the scrubber. */
+  marks?: { start: number; end: number }[];
+  marksLabel?: string;
 }
 
 export default function ReplayPlaybackBar({
@@ -27,7 +30,10 @@ export default function ReplayPlaybackBar({
   onTrailModeChange,
   onFrameChange,
   disabled = false,
+  marks,
+  marksLabel,
 }: ReplayPlaybackBarProps) {
+  const lastFrame = Math.max(totalFrames - 1, 1);
   const currentTime = totalFrames > 0 ? (frame / fps).toFixed(2) : "0.00";
   const totalTime = (totalFrames / fps).toFixed(2);
 
@@ -73,16 +79,36 @@ export default function ReplayPlaybackBar({
       </div>
 
       {/* Scrubber */}
-      <input
-        type="range"
-        min={0}
-        max={Math.max(totalFrames - 1, 0)}
-        value={frame}
-        onChange={onFrameChange}
-        disabled={disabled}
-        className="flex-1 min-w-16 mx-1 h-1 accent-accent cursor-pointer disabled:cursor-not-allowed"
-        aria-label="Seek frame"
-      />
+      <div className="relative flex-1 min-w-16 mx-1 flex items-center">
+        <input
+          type="range"
+          min={0}
+          max={Math.max(totalFrames - 1, 0)}
+          value={frame}
+          onChange={onFrameChange}
+          disabled={disabled}
+          className="w-full h-1 accent-accent cursor-pointer disabled:cursor-not-allowed"
+          aria-label="Seek frame"
+        />
+        {marks && marks.length > 0 && (
+          <div
+            className="pointer-events-none absolute inset-x-0 -bottom-1.5 h-1"
+            title={marksLabel}
+            aria-hidden="true"
+          >
+            {marks.map((m) => (
+              <span
+                key={m.start}
+                className="absolute h-full min-w-[2px] rounded-full bg-[var(--status-critical)]"
+                style={{
+                  left: `${(m.start / lastFrame) * 100}%`,
+                  width: `${((m.end - m.start) / lastFrame) * 100}%`,
+                }}
+              />
+            ))}
+          </div>
+        )}
+      </div>
       <span
         className="text-right tabular text-[11px] text-fg-muted shrink-0"
         title={`Frame ${frame} of ${Math.max(totalFrames - 1, 0)}`}

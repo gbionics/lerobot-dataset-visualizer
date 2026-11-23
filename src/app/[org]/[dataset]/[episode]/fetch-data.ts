@@ -23,6 +23,12 @@ import {
 import { isLocalMode, localHubEndpoint } from "@/utils/localDatasetShared";
 import { AsyncCache } from "@/utils/asyncCache";
 import {
+  episodeLimitReport,
+  type LimitReport,
+  type UrdfJoint,
+} from "@/utils/jointLimits";
+import type { RobotManifest } from "@/utils/robotManifest";
+import {
   dimensionStats,
   summarizeEpisodes,
   type DimensionStats,
@@ -220,6 +226,14 @@ export const episodeFramesCache = new AsyncCache<EpisodeFramesData>(4);
 export const datasetSchemaCache = new AsyncCache<DatasetSchema>(4);
 export const crossEpisodeCache =
   new AsyncCache<CrossEpisodeVarianceData | null>(4);
+/** Keyed by `datasetCacheKey` and the robot model: the limits are the model's. */
+export const jointLimitsCache = new AsyncCache<DatasetLimitScan>(4);
+
+export type DatasetLimitScan = {
+  episodes: { episode: number; report: LimitReport }[];
+  /** Episodes whose data couldn't be read. */
+  failed: number[];
+};
 
 export function datasetCacheKey(repoId: string): string {
   return `${repoId}\n${getAuthToken() ?? ""}`;
@@ -1861,6 +1875,40 @@ export async function loadEpisodeFlatChartData(
     episode,
   );
   return flatChartData;
+}
+
+/**
+ * Every episode's frames past a joint limit of the custom robot (v3.0). Episodes are read one at a
+ * time and only their report is kept.
+ */
+export async function loadDatasetLimitViolations(
+  repoId: string,
+  episodeIds: number[],
+  urdfJoints: UrdfJoint[],
+  manifest: RobotManifest,
+  onProgress?: (progress: { done: number; total: number }) => void,
+): Promise<DatasetLimitScan> {
+  const { version, info } = await getDatasetVersionAndInfo(repoId);
+  const scan: DatasetLimitScan = { episodes: [], failed: [] };
+  for (let i = 0; i < episodeIds.length; i++) {
+    const episode = episodeIds[i];
+    try {
+      const rows = await loadEpisodeFlatChartData(
+        repoId,
+        version,
+        info as unknown as DatasetMetadata,
+        episode,
+      );
+      scan.episodes.push({
+        episode,
+        report: episodeLimitReport(rows, urdfJoints, manifest),
+      });
+    } catch {
+      scan.failed.push(episode);
+    }
+    onProgress?.({ done: i + 1, total: episodeIds.length });
+  }
+  return scan;
 }
 
 // Safe wrapper for UI error display

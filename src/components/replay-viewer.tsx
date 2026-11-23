@@ -38,6 +38,26 @@ import { CHART_CONFIG } from "@/utils/constants";
 import { getDatasetVersionAndInfo } from "@/utils/versionUtils";
 import type { DatasetMetadata } from "@/utils/parquetUtils";
 import { useTheme } from "@/utils/theme";
+import {
+  BRAINCO_JOINT,
+  INSPIRE_JOINT,
+  autoMatchJoints,
+  defaultColumnGroup,
+  episodeAngleUnit,
+  groupColumnsByPrefix,
+  type AngleUnit,
+} from "@/utils/jointMapping";
+import {
+  findLimitViolations,
+  formatOvershoot,
+  framesOverRanges,
+  jointLimitsOf,
+  jointsOverAt,
+  jointValue,
+  type JointLimit,
+} from "@/utils/jointLimits";
+import { useUrdfJoints } from "@/utils/useUrdfJoints";
+import { Switch } from "@/components/ui";
 
 const SERIES_DELIM = CHART_CONFIG.SERIES_NAME_DELIMITER;
 const DEG2RAD = Math.PI / 180;
@@ -149,268 +169,8 @@ function getRobotConfig(
   };
 }
 
-// Detect unit: servo ticks (0-4096), degrees (>6.28), or radians
-type AngleUnit = "ticks" | "degrees" | "radians";
-
-/**
- * Decided once for the episode, from the largest value its joints take. Decided frame by frame, a
- * frame whose joints all happened to sit near zero read degrees as radians, and the arm jumped.
- */
-function detectAngleUnit(maxAbs: number): AngleUnit {
-  if (maxAbs > 360) return "ticks";
-  if (maxAbs > 6.3) return "degrees";
-  return "radians";
-}
-
-function toRadians(value: number, unit: AngleUnit): number {
-  if (unit === "ticks") return ((value - 2048) / 2048) * Math.PI;
-  if (unit === "degrees") return value * DEG2RAD;
-  return value;
-}
-
-/** Joints set by their own rules, not read as angles. */
-function isSpecialJoint(joint: string): boolean {
-  return (
-    joint.toLowerCase().includes("finger_joint1") ||
-    INSPIRE_JOINT.test(joint) ||
-    BRAINCO_JOINT.test(joint) ||
-    joint.includes("_dex1_finger_joint_")
-  );
-}
-
 /** Where the robot is at one frame: joint values by joint name, and the base pose (x y z qx qy qz qw). */
 type FramePose = { joints: Record<string, number>; base: number[] };
-
-function groupColumnsByPrefix(keys: string[]): Record<string, string[]> {
-  const groups: Record<string, string[]> = {};
-  for (const key of keys) {
-    if (key === "timestamp") continue;
-    const parts = key.split(SERIES_DELIM);
-    const feature = parts.length > 1 ? parts[0].trim() : "other";
-    /// Features split under observation.state or action (Unitree's left_arm, lower_body...) are one
-    /// source, so a robot's joints map from all of them.
-    const prefix =
-      feature.match(/^(observation\.state|action)\./)?.[1] ?? feature;
-    if (!groups[prefix]) groups[prefix] = [];
-    groups[prefix].push(key);
-  }
-  return groups;
-}
-
-// Unitree G1 SDK column suffix → joint name. Unitree's own datasets leave out the `.q`.
-const G1_SDK_TO_JOINT: Record<string, string> = {
-  "klefthippitch.q": "left_hip_pitch_joint",
-  "klefthiproll.q": "left_hip_roll_joint",
-  "klefthipyaw.q": "left_hip_yaw_joint",
-  "kleftknee.q": "left_knee_joint",
-  "kleftanklepitch.q": "left_ankle_pitch_joint",
-  "kleftankleroll.q": "left_ankle_roll_joint",
-  "krighthippitch.q": "right_hip_pitch_joint",
-  "krighthiproll.q": "right_hip_roll_joint",
-  "krighthipyaw.q": "right_hip_yaw_joint",
-  "krightknee.q": "right_knee_joint",
-  "krightanklepitch.q": "right_ankle_pitch_joint",
-  "krightankleroll.q": "right_ankle_roll_joint",
-  "kwaistyaw.q": "waist_yaw_joint",
-  "kwaistroll.q": "waist_roll_joint",
-  "kwaistpitch.q": "waist_pitch_joint",
-  "kleftshoulderpitch.q": "left_shoulder_pitch_joint",
-  "kleftshoulderroll.q": "left_shoulder_roll_joint",
-  "kleftshoulderyaw.q": "left_shoulder_yaw_joint",
-  "kleftelbow.q": "left_elbow_joint",
-  "kleftwristroll.q": "left_wrist_roll_joint",
-  "kleftwristpitch.q": "left_wrist_pitch_joint",
-  "kleftwristyaw.q": "left_wrist_yaw_joint",
-  "krightshoulderpitch.q": "right_shoulder_pitch_joint",
-  "krightshoulderroll.q": "right_shoulder_roll_joint",
-  "krightshoulderyaw.q": "right_shoulder_yaw_joint",
-  "krightelbow.q": "right_elbow_joint",
-  "krightwristroll.q": "right_wrist_roll_joint",
-  "krightwristpitch.q": "right_wrist_pitch_joint",
-  "krightwristyaw.q": "right_wrist_yaw_joint",
-  "klefthandthumb0.q": "left_hand_thumb_0_joint",
-  "klefthandthumb1.q": "left_hand_thumb_1_joint",
-  "klefthandthumb2.q": "left_hand_thumb_2_joint",
-  "klefthandmiddle0.q": "left_hand_middle_0_joint",
-  "klefthandmiddle1.q": "left_hand_middle_1_joint",
-  "klefthandindex0.q": "left_hand_index_0_joint",
-  "klefthandindex1.q": "left_hand_index_1_joint",
-  "krighthandthumb0.q": "right_hand_thumb_0_joint",
-  "krighthandthumb1.q": "right_hand_thumb_1_joint",
-  "krighthandthumb2.q": "right_hand_thumb_2_joint",
-  "krighthandmiddle0.q": "right_hand_middle_0_joint",
-  "krighthandmiddle1.q": "right_hand_middle_1_joint",
-  "krighthandindex0.q": "right_hand_index_0_joint",
-  "krighthandindex1.q": "right_hand_index_1_joint",
-};
-/// The body's 29 joints, in Unitree's motor order.
-const G1_BODY_JOINTS = Object.values(G1_SDK_TO_JOINT).slice(0, 29);
-/// Unitree's whole-body (SMPL) datasets record each hand's six motors as `hand_state | finger_0` to
-/// `finger_5` (left), then `finger_6` to `finger_11` (right), in an order that depends on the hand.
-const INSPIRE_FINGERS = [
-  "index",
-  "middle",
-  "ring",
-  "little",
-  "thumb_oc",
-  "thumb_lat",
-];
-const BRAINCO_FINGERS = [
-  "thumb_oc",
-  "thumb_lat",
-  "index",
-  "middle",
-  "ring",
-  "little",
-];
-
-function autoMatchJoints(
-  jointNames: string[],
-  columnKeys: string[],
-): Record<string, string> {
-  const mapping: Record<string, string> = {};
-  const suffixes = columnKeys.map((k) =>
-    (k.split(SERIES_DELIM).pop()?.trim() ?? k).toLowerCase(),
-  );
-
-  /// A side named by the feature rather than the column (`left_arm | shoulder_pitch`) joins the name.
-  const sided = columnKeys.map((k, i) => {
-    const side = k.split(SERIES_DELIM)[0].match(/\.(left|right)_[^.]*$/)?.[1];
-    return side && !suffixes[i].startsWith(`${side}_`)
-      ? `${side}_${suffixes[i]}`
-      : suffixes[i];
-  });
-
-  // Build reverse lookup: joint name → column key (for G1 SDK-style columns)
-  const g1Reverse = new Map<string, string>();
-  for (let i = 0; i < suffixes.length; i++) {
-    /// Unitree's whole-body (SMPL) datasets: `robot_q_current | q_7` to `q_35` are the body's joints,
-    /// after the root's pose.
-    const q = columnKeys[i].includes("robot_q_current")
-      ? suffixes[i].match(/^q_(\d+)$/)
-      : null;
-    const jointName = q
-      ? G1_BODY_JOINTS[Number(q[1]) - 7]
-      : (G1_SDK_TO_JOINT[suffixes[i]] ?? G1_SDK_TO_JOINT[`${suffixes[i]}.q`]);
-    if (jointName) g1Reverse.set(jointName, columnKeys[i]);
-  }
-
-  for (const jointName of jointNames) {
-    const lower = jointName.toLowerCase();
-
-    // Exact match on column suffix
-    const exactIdx = suffixes.findIndex((s) => s === lower);
-    if (exactIdx >= 0) {
-      mapping[jointName] = columnKeys[exactIdx];
-      continue;
-    }
-
-    // G1 / Unitree SDK name match
-    const g1Col = g1Reverse.get(lower);
-    if (g1Col) {
-      mapping[jointName] = g1Col;
-      continue;
-    }
-
-    // Without the `_joint` suffix: left_hip_pitch_joint → `left_hip_pitch`, or `hip_pitch` in left_leg
-    const sidedIdx = sided.indexOf(lower.replace(/_joint$/, ""));
-    if (sidedIdx >= 0) {
-      mapping[jointName] = columnKeys[sidedIdx];
-      continue;
-    }
-
-    // OpenArm: openarm_(left|right)_joint(\d+) → (left|right)_joint_(\d+) or (left|right)_joint(\d+),
-    // whole words so joint1 doesn't take joint10
-    const armMatch = lower.match(/^openarm_(left|right)_joint(\d+)$/);
-    if (armMatch) {
-      const pattern = new RegExp(
-        `(^|_)${armMatch[1]}_joint_?${armMatch[2]}(\\D|$)`,
-      );
-      const idx = suffixes.findIndex((s) => pattern.test(s));
-      if (idx >= 0) {
-        mapping[jointName] = columnKeys[idx];
-        continue;
-      }
-    }
-
-    // OpenArm: openarm_(left|right)_finger_joint1 → (left|right)_gripper
-    const fingerMatch = lower.match(/^openarm_(left|right)_finger_joint1$/);
-    if (fingerMatch) {
-      const pattern = `${fingerMatch[1]}_gripper`;
-      const idx = suffixes.findIndex((s) => s.includes(pattern));
-      if (idx >= 0) {
-        mapping[jointName] = columnKeys[idx];
-        continue;
-      }
-    }
-
-    // Dex1: both fingers of (left|right)_dex1 → `left_gripper | gripper_pos` or `kLeftGripper`
-    const dex1Match = lower.match(/^(left|right)_dex1_finger_joint_[12]$/);
-    if (dex1Match) {
-      const idx = sided.findIndex((s) =>
-        s
-          .replace(/^k/, "")
-          .replace(/_/g, "")
-          .startsWith(`${dex1Match[1]}gripper`),
-      );
-      if (idx >= 0) {
-        mapping[jointName] = columnKeys[idx];
-        continue;
-      }
-    }
-
-    // Inspire: (L|R)_<finger>_proximal_joint and the thumb's yaw and pitch → `left_fig6d | index`,
-    // `little`, `thumb_lat` and `thumb_oc`
-    const inspireMatch = lower.match(INSPIRE_JOINT);
-    if (inspireMatch) {
-      const [, side, finger, thumbAxis] = inspireMatch;
-      const name =
-        finger === "pinky"
-          ? "little"
-          : thumbAxis === "yaw"
-            ? "thumb_lat"
-            : thumbAxis === "pitch"
-              ? "thumb_oc"
-              : finger;
-      const idx = sided.indexOf(`${side === "l" ? "left" : "right"}_${name}`);
-      const fingerIdx = suffixes.indexOf(
-        `finger_${(side === "l" ? 0 : 6) + INSPIRE_FINGERS.indexOf(name)}`,
-      );
-      if (idx >= 0 || fingerIdx >= 0) {
-        mapping[jointName] = columnKeys[idx >= 0 ? idx : fingerIdx];
-        continue;
-      }
-    }
-
-    // BrainCo: <side>_<finger>_proximal_joint and the thumb's metacarpal (sideways) and proximal
-    // (bending) joints → `left_fig6d | index`, `little`, `thumb_lat` and `thumb_oc`
-    const braincoMatch = lower.match(BRAINCO_JOINT);
-    if (braincoMatch) {
-      const [, side, finger, thumbJoint] = braincoMatch;
-      const name =
-        finger === "pinky"
-          ? "little"
-          : thumbJoint === "metacarpal"
-            ? "thumb_lat"
-            : thumbJoint === "proximal"
-              ? "thumb_oc"
-              : finger;
-      const idx = sided.indexOf(`${side}_${name}`);
-      const fingerIdx = suffixes.indexOf(
-        `finger_${(side === "left" ? 0 : 6) + BRAINCO_FINGERS.indexOf(name)}`,
-      );
-      if (idx >= 0 || fingerIdx >= 0) {
-        mapping[jointName] = columnKeys[idx >= 0 ? idx : fingerIdx];
-        continue;
-      }
-    }
-
-    // Generic fuzzy fallback
-    const fuzzy = columnKeys.find((k) => k.toLowerCase().includes(lower));
-    if (fuzzy) mapping[jointName] = fuzzy;
-  }
-  return mapping;
-}
 
 const BASE_POSE_NAMES = ["x", "y", "z", "qx", "qy", "qz", "qw"];
 const Z_UP_TO_Y_UP = new THREE.Quaternion().setFromAxisAngle(
@@ -458,10 +218,6 @@ const G1_TIP_NAMES = [
 const DEX1_MOTOR_TRAVEL = 5.4;
 const DEX1_FINGER_CLOSED = -0.02;
 const DEX1_FINGER_OPEN = 0.0245;
-/// The Inspire hands' motors: a finger's proximal joint, or the thumb's yaw or pitch. The other
-/// finger joints follow them (mimic joints).
-const INSPIRE_JOINT =
-  /^([lr])_(index|middle|ring|pinky|thumb)_proximal(?:_(yaw|pitch))?_joint$/i;
 
 /**
  * An Inspire motor's joint angle from its recorded value, 1 open to 0 closed (Unitree's
@@ -472,11 +228,6 @@ function inspireJointValue(joint: string, open: number): number {
   if (joint.endsWith("_pitch_joint")) return 0.5 * (1 - open);
   return 1.7 * (1 - open);
 }
-
-/// The BrainCo hands' motors: a finger's proximal joint, or the thumb's metacarpal or proximal
-/// joint. The distal joints follow them (mimic joints).
-const BRAINCO_JOINT =
-  /^(left|right)_(?:(index|middle|ring|pinky)_proximal|thumb_(metacarpal|proximal))_joint$/i;
 
 /**
  * A BrainCo motor's joint angle from its recorded value, 1 open to 0 closed: Unitree records one
@@ -1071,11 +822,7 @@ export default function ReplayViewer({
 
   const groupNames = useMemo(() => Object.keys(columnGroups), [columnGroups]);
   const defaultGroup = useMemo(
-    () =>
-      groupNames.find((g) => g.toLowerCase().includes("state")) ??
-      groupNames.find((g) => g.toLowerCase().includes("action")) ??
-      groupNames[0] ??
-      "",
+    () => defaultColumnGroup(groupNames),
     [groupNames],
   );
 
@@ -1172,19 +919,70 @@ export default function ReplayViewer({
     return ranges;
   }, [chartData, mapping, jointNames]);
 
+  // The custom robot's URDF: its joint types (a prismatic joint is in metres) and limits.
+  const urdfJoints = useUrdfJoints(customRobot);
+  const jointTypes = useMemo(
+    () =>
+      new Map(
+        (customRobot && urdfJoints ? urdfJoints : []).map((j) => [
+          j.name,
+          j.type,
+        ]),
+      ),
+    [customRobot, urdfJoints],
+  );
+  const limits = useMemo<Record<string, JointLimit>>(
+    () => (customRobot && urdfJoints ? jointLimitsOf(urdfJoints) : {}),
+    [customRobot, urdfJoints],
+  );
+
   /// The unit the episode's joint angles are in, from the largest value they take anywhere in it.
-  const angleUnit = useMemo<AngleUnit>(() => {
-    let maxAbs = 0;
-    for (const jn of jointNames) {
-      const col = mapping[jn];
-      if (!col || isSpecialJoint(jn)) continue;
-      for (const row of chartData) {
-        const v = Math.abs(row[col]);
-        if (Number.isFinite(v) && v > maxAbs) maxAbs = v;
-      }
-    }
-    return detectAngleUnit(maxAbs);
-  }, [chartData, jointNames, mapping]);
+  const angleUnit = useMemo<AngleUnit>(
+    () =>
+      episodeAngleUnit(
+        chartData,
+        mapping,
+        jointNames,
+        (jn) => jointTypes.get(jn) === "prismatic",
+      ),
+    [chartData, jointNames, mapping, jointTypes],
+  );
+
+  const limitReport = useMemo(
+    () => findLimitViolations(chartData, mapping, limits, angleUnit),
+    [chartData, mapping, limits, angleUnit],
+  );
+  const limitMarks = useMemo(
+    () => framesOverRanges(limitReport),
+    [limitReport],
+  );
+  const hasLimits = Object.keys(limits).length > 0;
+  const [showLimits, setShowLimits] = useState(true);
+  const [showLimitReport, setShowLimitReport] = useState(false);
+  /// Joints past a limit on this frame; a new Set only when they change, so the scene isn't redone.
+  const overKey = useMemo(
+    () => [...jointsOverAt(limitReport, frame)].sort().join("\n"),
+    [limitReport, frame],
+  );
+  const overNow = useMemo(
+    () => new Set(overKey ? overKey.split("\n") : []),
+    [overKey],
+  );
+  /// Three.js needs a real colour: the token's value, read again when the theme changes.
+  const criticalColor = useMemo(() => {
+    void dark;
+    if (typeof window === "undefined") return undefined;
+    return (
+      getComputedStyle(document.documentElement)
+        .getPropertyValue("--status-critical")
+        .trim() || undefined
+    );
+  }, [dark]);
+  const seekFrame = useCallback((f: number) => {
+    setPlaying(false);
+    setFrame(f);
+    frameRef.current = f;
+  }, []);
 
   /// The pose at any frame: the scene shows the current one, and works out the trail's path
   /// from all of them.
@@ -1223,7 +1021,7 @@ export default function ReplayViewer({
             DEX1_FINGER_CLOSED +
             (raw / DEX1_MOTOR_TRAVEL) * (DEX1_FINGER_OPEN - DEX1_FINGER_CLOSED);
         } else {
-          joints[jn] = toRadians(raw, angleUnit);
+          joints[jn] = jointValue(raw, jointTypes.get(jn), angleUnit);
         }
       }
 
@@ -1240,6 +1038,7 @@ export default function ReplayViewer({
       chartData,
       gripperRanges,
       jointNames,
+      jointTypes,
       mapping,
       restHeight,
       totalFrames,
@@ -1361,6 +1160,8 @@ export default function ReplayViewer({
               scale={scale}
               onJointsLoaded={onJointsLoaded}
               fitCamera={fitCameraToRobot}
+              highlightJoints={showLimits ? overNow : undefined}
+              highlightColor={criticalColor}
             />
           ) : (
             /// In local mode the Hub's model loads only once it is known there is no custom robot.
@@ -1420,7 +1221,106 @@ export default function ReplayViewer({
           onTrailModeChange={setTrailMode}
           onFrameChange={handleFrameChange}
           disabled={modelLoading}
+          marks={showLimits ? limitMarks : undefined}
+          marksLabel="Frames past a joint limit"
         />
+
+        {hasLimits && (
+          <>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
+              <button
+                onClick={() => setShowLimitReport((v) => !v)}
+                aria-expanded={showLimitReport}
+                className="flex items-center gap-1.5 text-xs text-fg-muted hover:text-fg transition-colors"
+              >
+                <span
+                  className={`transition-transform ${showLimitReport ? "rotate-90" : ""}`}
+                >
+                  ▶
+                </span>
+                Joint Limits
+                <span
+                  className={
+                    limitReport.joints.length > 0
+                      ? "text-critical-fg"
+                      : "text-fg-faint"
+                  }
+                >
+                  {limitReport.joints.length > 0
+                    ? `(${limitReport.joints.length} over, in ${limitReport.framesOver} of ${limitReport.totalFrames} frames)`
+                    : "(all within limits)"}
+                </span>
+              </button>
+              <Switch
+                checked={showLimits}
+                onChange={setShowLimits}
+                offLabel={<span className="text-xs">Off</span>}
+                onLabel={<span className="text-xs">Highlight over limit</span>}
+                ariaLabel="Highlight joints past their limits"
+              />
+            </div>
+            {showLimitReport && limitReport.joints.length > 0 && (
+              <div className="max-h-48 overflow-y-auto">
+                <table className="w-full text-xs">
+                  <thead className="sticky top-0 bg-[var(--surface-1)]">
+                    <tr className="text-fg-faint">
+                      <th className="text-left font-normal px-1">Joint</th>
+                      <th className="text-right font-normal px-1">Frames</th>
+                      <th className="text-right font-normal px-1">Worst</th>
+                      <th className="text-left font-normal px-1">
+                        When (click to go there)
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {limitReport.joints.map((v) => (
+                      <tr key={v.joint} className="border-t border-line">
+                        <td
+                          className={`px-1 py-0.5 font-mono ${overNow.has(v.joint) ? "text-critical-fg" : "text-fg-soft"}`}
+                        >
+                          {v.joint}
+                        </td>
+                        <td className="px-1 text-right tabular text-fg-muted">
+                          {v.frames}
+                        </td>
+                        <td className="px-1 text-right tabular">
+                          <button
+                            onClick={() => seekFrame(v.worstFrame)}
+                            title={`Frame ${v.worstFrame}`}
+                            className="text-critical-fg hover:underline"
+                          >
+                            {formatOvershoot(v.worst, v.type)}
+                          </button>
+                        </td>
+                        <td className="px-1 py-0.5">
+                          <div className="flex flex-wrap gap-1">
+                            {v.ranges.slice(0, 8).map((r) => (
+                              <button
+                                key={r.start}
+                                onClick={() => seekFrame(r.start)}
+                                className="tabular rounded border border-line bg-fill px-1 text-fg-muted hover:text-fg hover:bg-fill-strong"
+                              >
+                                {(r.start / fps).toFixed(2)}s
+                                {r.end > r.start
+                                  ? `–${(r.end / fps).toFixed(2)}s`
+                                  : ""}
+                              </button>
+                            ))}
+                            {v.ranges.length > 8 && (
+                              <span className="text-fg-faint">
+                                +{v.ranges.length - 8} more
+                              </span>
+                            )}
+                          </div>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </>
+        )}
 
         {/* Collapsible joint mapping */}
         <button
@@ -1465,6 +1365,9 @@ export default function ReplayViewer({
                     <th className="text-left font-normal px-1">
                       Dataset Column
                     </th>
+                    {hasLimits && (
+                      <th className="text-right font-normal px-1">Limits</th>
+                    )}
                     <th className="text-right font-normal px-1">Value</th>
                   </tr>
                 </thead>
@@ -1497,7 +1400,16 @@ export default function ReplayViewer({
                           })}
                         </select>
                       </td>
-                      <td className="px-1 py-0.5 text-right tabular-nums text-fg-muted font-mono">
+                      {hasLimits && (
+                        <td className="px-1 py-0.5 text-right tabular-nums text-fg-faint font-mono whitespace-nowrap">
+                          {limits[jointName]
+                            ? `${limits[jointName].lower.toFixed(3)} … ${limits[jointName].upper.toFixed(3)}`
+                            : "—"}
+                        </td>
+                      )}
+                      <td
+                        className={`px-1 py-0.5 text-right tabular-nums font-mono ${overNow.has(jointName) ? "text-critical-fg" : "text-fg-muted"}`}
+                      >
                         {jointValues[jointName] !== undefined
                           ? jointValues[jointName].toFixed(3)
                           : "—"}
