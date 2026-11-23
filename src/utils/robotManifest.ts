@@ -11,6 +11,8 @@ export type RobotManifest = {
   scale?: number;
   /** Height of the model's root above the floor when the data has no base pose. */
   restHeight?: number;
+  /** URDF link placed at the origin. */
+  rootLink?: string;
   /** URDF joint name → dataset column name (the part after the feature prefix). */
   joints?: Record<string, string>;
   /** URDF `package://<name>/` → directory relative to the model directory. Default: `<name>`. */
@@ -37,6 +39,8 @@ export function parseRobotManifest(json: unknown): RobotManifest | null {
   if (Array.isArray(m.match) && m.match.every((s) => typeof s === "string"))
     manifest.match = m.match;
   if (typeof m.scale === "number" && m.scale > 0) manifest.scale = m.scale;
+  if (typeof m.rootLink === "string" && m.rootLink !== "")
+    manifest.rootLink = m.rootLink;
   if (typeof m.restHeight === "number") manifest.restHeight = m.restHeight;
   if (isStringRecord(m.joints)) manifest.joints = m.joints;
   if (isStringRecord(m.packages)) manifest.packages = m.packages;

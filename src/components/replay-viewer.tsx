@@ -980,8 +980,10 @@ export default function ReplayViewer({
       ? manifest
       : null;
   const { robot, usdUrl } = robotConfig;
-  const scale = customRobot?.scale ?? robotConfig.scale;
-  const restHeight = customRobot?.restHeight ?? robotConfig.restHeight;
+  const scale = customRobot ? (customRobot.scale ?? 1) : robotConfig.scale;
+  const restHeight = customRobot
+    ? (customRobot.restHeight ?? 0)
+    : robotConfig.restHeight;
   const isG1 = robot === "g1";
   const isOpenArm = robot === "openarm";
   const repoId = org && dataset ? `${org}/${dataset}` : null;

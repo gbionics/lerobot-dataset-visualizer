@@ -161,6 +161,7 @@ $ROBOT_MODEL_DIR/
   "match": ["my_robot"],
   "scale": 1,
   "restHeight": 0,
+  "rootLink": "root_link",
   "joints": { "urdf_joint_name": "dataset_column_name" },
   "packages": { "my_pkg": "meshes" },
   "meshColor": "#8a8f98"
@@ -168,6 +169,7 @@ $ROBOT_MODEL_DIR/
 ```
 
 - `match`: used when the dataset's `robot_type` contains one of these strings (case-insensitive); omit to match every dataset.
+- `rootLink`: URDF link placed at the origin.
 - `joints`: URDF joint → dataset column (the part after the feature prefix). Unmapped joints can be set in the viewer's Joint Mapping panel.
 - `packages`: resolves `package://<name>/...` URIs to a directory inside the model directory (default `<name>`).
 

@@ -51,6 +51,12 @@ export default function CustomRobotScene({
   useEffect(() => {
     let disposed = false;
     const manager = new THREE.LoadingManager();
+    // The meshes arrive after the URDF: frame the camera once they are all in.
+    manager.onLoad = () => {
+      if (disposed) return;
+      pendingFitRef.current = true;
+      setVersion((v) => v + 1);
+    };
     const loader = new URDFLoader(manager);
     const urdfDir = manifest.urdf.split("/").slice(0, -1).join("/");
     loader.workingPath = fileUrl(urdfDir);
@@ -147,17 +153,33 @@ export default function CustomRobotScene({
     const robot = robotRef.current;
     if (!robot) return;
     const [, , z, qx, qy, qz, qw] = basePose;
-    /// Z-up like the base pose; the robot stays above the origin and the floor moves under it.
-    robot.position.set(0, z * scale, 0);
-    robot.quaternion
-      .copy(Z_UP_TO_Y_UP)
-      .multiply(poseQuaternion.set(qx, qy, qz, qw));
-    robot.scale.setScalar(scale);
     for (const [name, value] of Object.entries(jointValues)) {
       const joint = robot.joints[name];
       if (!joint) continue;
       joint.setJointValue(value);
     }
+    robot.position.set(0, 0, 0);
+    robot.quaternion.identity();
+    robot.scale.setScalar(1);
+    robot.updateMatrixWorld(true);
+    /// Z-up like the base pose; the robot stays above the origin and the floor moves under it.
+    const pose = new THREE.Matrix4().compose(
+      new THREE.Vector3(0, manifest.rootLink ? 0 : z * scale, 0),
+      new THREE.Quaternion()
+        .copy(Z_UP_TO_Y_UP)
+        .multiply(poseQuaternion.set(qx, qy, qz, qw)),
+      new THREE.Vector3(scale, scale, scale),
+    );
+    const anchor = manifest.rootLink ? robot.frames[manifest.rootLink] : null;
+    if (anchor) {
+      // The anchor link is the origin, so the robot hangs from it rather than from its own root.
+      const anchorInRobot = robot.matrixWorld
+        .clone()
+        .invert()
+        .multiply(anchor.matrixWorld);
+      pose.multiply(anchorInRobot.invert());
+    }
+    pose.decompose(robot.position, robot.quaternion, robot.scale);
     robot.updateMatrixWorld(true);
     if (pendingFitRef.current) {
       pendingFitRef.current = false;
@@ -168,6 +190,7 @@ export default function CustomRobotScene({
     jointValues,
     basePose,
     scale,
+    manifest.rootLink,
     version,
     camera,
     controls,
